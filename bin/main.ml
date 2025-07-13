@@ -140,7 +140,7 @@ let expect token tokens =
 (* 主解析函数 *)
 let rec parse_program tokens : program * token list =
   match tokens with
-  | [T_Eof] -> ([], [])
+  | T_Eof :: _ -> ([], tokens) (* If T_Eof is found, no more definitions to parse. Return remaining tokens (which should just be T_Eof). *)
   | _ ->
       let (def, rest_tokens) = parse_top_level_def tokens in
       let (defs, final_tokens) = parse_program rest_tokens in
