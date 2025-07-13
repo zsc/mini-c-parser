@@ -641,7 +641,19 @@ module Codegen = struct
         else
           [Printf.sprintf "  %s = %s i32 %s, %s" dest_reg op_str s_op1 s_op2]
     | D_Call (name, args) ->
-        let arg_strs = List.map (fun op -> "i32 " ^ string_of_ssa_operand op) args in
+        let get_arg_with_type op =
+          let s_op = string_of_ssa_operand op in
+          let ssa_type = match op with
+            | O_Cst _ -> "int" (* Constants are always int in our language *)
+            | O_Reg r ->
+                (try Hashtbl.find reg_types r
+                 with Not_found -> failwith ("codegen: could not find type for register " ^ string_of_ssa_reg r))
+            | O_Global _ -> failwith "codegen: cannot use global as function argument"
+          in
+          (ll_type_of_ssa_type ssa_type) ^ " " ^ s_op
+        in
+        let arg_strs = List.map get_arg_with_type args in
+        (* The compiler currently assumes all functions return int (i32). *)
         [Printf.sprintf "  %s = call i32 @%s(%s)" dest_reg name (String.concat ", " arg_strs)]
     | D_Phi _ -> failwith "LLVM Codegen: Phi nodes not supported in this simplified compiler"
     | D_Alloca typ ->
