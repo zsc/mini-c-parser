@@ -15,9 +15,8 @@
   and then print the generated LLVM IR as a string.
 *)
 
-
-(* I. AST Definition *)
 open Ast
+open Ssa
 
 
 (* II. Tokenizer (Lexer) *)
