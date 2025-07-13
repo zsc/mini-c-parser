@@ -243,8 +243,7 @@ module Ast_to_ssa = struct
     mutable reg_counter: int;
     mutable bbid_counter: int;
     var_map: (string, reg) Hashtbl.t; (* var name -> reg holding pointer *)
-    mutable current_block_instrs: instruction list;
-    mutable current_block_side_effects: side_effect_instr list;
+    mutable current_block_ops: operation list;
     mutable func_blocks: basic_block list;
     mutable current_bbid: bbid;
     mutable is_sealed: bool; (* true if the current block is terminated *)
@@ -257,8 +256,7 @@ module Ast_to_ssa = struct
     reg_counter = 0;
     bbid_counter = 0;
     var_map = Hashtbl.create 16;
-    current_block_instrs = [];
-    current_block_side_effects = [];
+    current_block_ops = [];
     func_blocks = [];
     current_bbid = L (-1); (* Invalid initial bbid *)
     is_sealed = true; (* A new context has no open block to add to *)
@@ -268,13 +266,11 @@ module Ast_to_ssa = struct
   let seal_block ctx term =
     let new_block = {
       id = ctx.current_bbid;
-      instrs = List.rev ctx.current_block_instrs;
-      side_effects = List.rev ctx.current_block_side_effects;
+      ops = List.rev ctx.current_block_ops;
       term = term;
     } in
     ctx.func_blocks <- new_block :: ctx.func_blocks;
-    ctx.current_block_instrs <- [];
-    ctx.current_block_side_effects <- [];
+    ctx.current_block_ops <- [];
     ctx.is_sealed <- true;
     ()
 
@@ -288,11 +284,11 @@ module Ast_to_ssa = struct
   let add_instr ctx def =
     let reg = new_reg ctx in
     let instr = { reg; def } in
-    ctx.current_block_instrs <- instr :: ctx.current_block_instrs;
+    ctx.current_block_ops <- I_Instr instr :: ctx.current_block_ops;
     reg
 
   let add_side_effect ctx sei =
-    ctx.current_block_side_effects <- sei :: ctx.current_block_side_effects
+    ctx.current_block_ops <- I_Side_Effect sei :: ctx.current_block_ops
 
   let rec convert_expr ctx (expr: Ast.expr) : operand =
     match expr with
@@ -466,9 +462,11 @@ module Ssa_printer = struct
     | T_CBr (cond, ltrue, lfalse) -> Printf.sprintf "cbr %s, %s, %s" (string_of_operand cond) (string_of_bbid ltrue) (string_of_bbid lfalse)
 
   let string_of_basic_block bb =
-    let instrs_str = String.concat "\n" (List.map string_of_instruction bb.instrs) in
-    let side_effects_str = String.concat "\n" (List.map string_of_side_effect bb.side_effects) in
-    let parts = [string_of_bbid bb.id ^ ":"; instrs_str; side_effects_str; string_of_terminator bb.term] in
+    let ops_str = String.concat "\n" (List.map (function
+      | I_Instr i -> string_of_instruction i
+      | I_Side_Effect s -> string_of_side_effect s
+      ) bb.ops) in
+    let parts = [string_of_bbid bb.id ^ ":"; ops_str; string_of_terminator bb.term] in
     String.concat "\n" (List.filter (fun s -> s <> "") parts)
 
   let string_of_func_def f =
@@ -550,10 +548,12 @@ module Codegen = struct
 
   let codegen_bb (bb: basic_block) : string list =
     let label = (string_of_ssa_bbid bb.id) ^ ":" in
-    let instrs = List.concat_map codegen_instr bb.instrs in
-    let side_effects = List.map codegen_side_effect bb.side_effects in
+    let ops_code = List.concat_map (function
+      | I_Instr i -> codegen_instr i
+      | I_Side_Effect s -> [codegen_side_effect s]
+      ) bb.ops in
     let term = codegen_terminator bb.term in
-    [label] @ instrs @ side_effects @ term
+    [label] @ ops_code @ term
 
   let codegen_func (f: func_def) : string =
     let param_strs = List.map (fun r -> "i32 " ^ string_of_ssa_reg r) f.params in
