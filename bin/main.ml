@@ -1,4 +1,4 @@
-(* file: bin/main.ml *)
+(* file: main.ml *)
 
 (*
   OCaml Mini-C Compiler to LLVM IR

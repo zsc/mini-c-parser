@@ -1,4 +1,4 @@
-(* bin/ast.ml *)
+(* ast.ml *)
 (* 操作符类型 *)
 type binop =
   | Add | Sub | Mul | Div
