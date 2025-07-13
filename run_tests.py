@@ -27,7 +27,7 @@ def run_command(command, stdin_content=None):
     print(f"  > Executing: {' '.join(command)}")
     try:
         # 如果有 stdin_content，我们通过管道传递它
-        input_data = stdin_content # stdin_content.encode('utf-8') if stdin_content else None
+        input_data = stdin_content
         
         process = subprocess.run(
             command,
@@ -60,8 +60,6 @@ def main():
     if not c_files:
         print(f"Error: No .c files found in '{C_TEST_DIR}'.", file=sys.stderr)
         sys.exit(1)
-
-    c_files = c_files[:1]
 
     all_results = {}
 
