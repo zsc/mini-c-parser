@@ -600,7 +600,38 @@ let string_of_program (p: program) = String.concat "\n\n" (List.map string_of_de
 
 
 (* VIII. Main Driver *)
-let () =
+
+(* Helper to read all content from a channel *)
+let read_all_from_channel chan =
+  let buf = Buffer.create 4096 in
+  try
+    while true do
+      Buffer.add_string buf (input_line chan);
+      Buffer.add_char buf '\n'
+    done;
+    "" (* Unreachable *)
+  with End_of_file ->
+    Buffer.contents buf
+
+(* The main compilation pipeline for normal operation (stdin to stdout) *)
+let run_normal_mode () =
+  let input_code = read_all_from_channel stdin in
+  match parse_from_string input_code with
+  | Error msg ->
+      prerr_endline msg;
+      exit 1
+  | Ok ast ->
+      let ssa_ir = Ast_to_ssa.convert_program ast in
+      let optimized_ssa_ir = List.map Dce.run_on_function ssa_ir in
+      match Codegen.codegen_program optimized_ssa_ir with
+      | Error msg ->
+          prerr_endline msg;
+          exit 1
+      | Ok ir_string ->
+          print_endline ir_string
+
+(* A verbose test run that prints intermediate stages for a hardcoded example *)
+let run_test_mode () =
   let input_code = "
     int fac(int n) {
       int unused_declaration; // This alloca should be removed by DCE
@@ -617,7 +648,7 @@ let () =
     }
   " in
 
-  print_endline "--- Mini-C Compiler ---";
+  print_endline "--- Mini-C Compiler (Test Mode) ---";
   print_endline "Input Code:";
   print_endline "--------------------------";
   print_endline input_code;
@@ -655,11 +686,8 @@ let () =
           print_endline ("Codegen failed: " ^ msg);
           exit 1
       | Ok ir_string ->
-          (* --- Phase 5: Output --- *)
           print_endline "Successfully generated LLVM IR from optimized SSA:";
           print_endline ir_string;
-
-          (* Write to a file *)
           let output_filename = "output.ll" in
           (try
             let oc = open_out output_filename in
@@ -668,3 +696,10 @@ let () =
             Printf.printf "\nLLVM IR also written to %s\n" output_filename
           with Sys_error err ->
             Printf.eprintf "Error writing to file %s: %s\n" output_filename err);
+          ()
+
+let () =
+  if Array.length Sys.argv > 1 && Sys.argv.(1) = "--test" then
+    run_test_mode ()
+  else
+    run_normal_mode ()
