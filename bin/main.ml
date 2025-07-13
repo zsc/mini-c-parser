@@ -106,10 +106,19 @@ exception Parser_error of string
 
 let fail_parse msg = raise (Parser_error msg)
 
+let string_of_token = function
+  | T_Int -> "T_Int" | T_Return -> "T_Return" | T_If -> "T_If" | T_Else -> "T_Else"
+  | T_Id s -> Printf.sprintf "T_Id(%s)" s | T_Num n -> Printf.sprintf "T_Num(%d)" n
+  | T_Plus -> "T_Plus" | T_Minus -> "T_Minus" | T_Star -> "T_Star" | T_Slash -> "T_Slash"
+  | T_Le -> "T_Le" | T_Eq -> "T_Eq" | T_Ne -> "T_Ne" | T_Lt -> "T_Lt" | T_Gt -> "T_Gt" | T_Ge -> "T_Ge"
+  | T_Lparen -> "T_Lparen" | T_Rparen -> "T_Rparen" | T_Assign -> "T_Assign"
+  | T_Lbrace -> "T_Lbrace" | T_Rbrace -> "T_Rbrace" | T_Lbracket -> "T_Lbracket" | T_Rbracket -> "T_Rbracket"
+  | T_Comma -> "T_Comma" | T_Semicolon -> "T_Semicolon" | T_Eof -> "T_Eof"
+
 let expect token tokens =
   match tokens with
   | t :: rest when t = token -> rest
-  | t :: _ -> fail_parse (Printf.sprintf "Expected a certain token but found another")
+  | t :: _ -> fail_parse (Printf.sprintf "Expected token %s but found %s" (string_of_token token) (string_of_token t))
   | [] -> fail_parse "Unexpected end of input"
 
 let rec parse_program tokens : program * token list =
@@ -258,8 +267,8 @@ let parse_from_string str =
     let tokens = tokenize str in
     match parse_program tokens with
     | ast, (T_Eof :: _) -> Ok ast
-    | _, t :: _ -> Error "Parser error: Did not consume all tokens."
-    | _ -> Error "Parser error: Unknown."
+    | _, t :: _ -> Error (Printf.sprintf "Parser error: Did not consume all tokens, starting with %s." (string_of_token t))
+    | _ -> Error "Parser error: Unknown (unexpected tokens remaining)."
   with
   | Parser_error msg -> Error ("Parser error: " ^ msg)
   | Failure msg -> Error ("Lexer/Parser failure: " ^ msg)
@@ -364,7 +373,7 @@ module Codegen = struct
     | Decl (_, name, init_opt) ->
         (* Create an alloca for the local variable in the function's entry block. *)
         let func = Llvm.block_parent (Llvm.insertion_block builder) in
-        let entry_builder = Llvm.builder_at_entry (Llvm.entry_block func) in
+        let entry_builder = Llvm.builder_at_end the_context (Llvm.entry_block func) in
         let alloca = Llvm.build_alloca i32_type name entry_builder in
         Hashtbl.add named_values name alloca;
 
@@ -405,7 +414,7 @@ module Codegen = struct
 
     (* Verify function and return it *)
     Llvm_analysis.assert_valid_function the_function;
-    the_function
+    ignore the_function
 
   let codegen_program (prog: program) =
     (* Pass 1: Declare all functions so they can be called before being defined (recursion) *)
@@ -432,7 +441,6 @@ let rec string_of_expr = function
       Printf.sprintf "(%s %s %s)" (string_of_expr e1) op_str (string_of_expr e2)
   | Call (n, args) -> Printf.sprintf "%s(%s)" n (String.concat ", " (List.map string_of_expr args))
   | ArrayAccess (b, i) -> Printf.sprintf "%s[%s]" (string_of_expr b) (string_of_expr i)
-  | Assign(l, r) -> Printf.sprintf "(%s = %s)" (string_of_expr l) (string_of_expr r)
 
 let rec string_of_stmt indent = function
   | Return e -> indent ^ "Return " ^ (string_of_expr e) ^ ";"
