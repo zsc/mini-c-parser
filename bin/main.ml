@@ -234,39 +234,249 @@ let parse_from_string str =
   | Parser_error msg -> Error ("Parser error: " ^ msg)
   | Failure msg -> Error ("Lexer/Parser failure: " ^ msg)
 
-(* IV. Code Generation (to LLVM IR as String) *)
+(* IV. AST to SSA Conversion *)
+module Ast_to_ssa = struct
+  open Ast
+  open Ssa
 
-module Codegen = struct
-  (* Helper for logging *)
-  let log msg = print_endline ("[Codegen] " ^ msg)
-
-  (* --- State Management for Code Generation --- *)
-  type codegen_context = {
-    mutable temp_counter: int;          (* For generating unique temporary register names, e.g., %1, %2 *)
-    mutable label_counter: int;         (* For generating unique label names, e.g., if.then1, if.end2 *)
-    symbol_table: (string, string) Hashtbl.t; (* Maps C var names to LLVM pointer names, e.g., "n" -> "%n.addr" *)
+  type ssa_builder_context = {
+    mutable reg_counter: int;
+    mutable bbid_counter: int;
+    var_map: (string, reg) Hashtbl.t; (* var name -> reg holding pointer *)
+    mutable current_block_instrs: instruction list;
+    mutable current_block_side_effects: side_effect_instr list;
+    mutable func_blocks: basic_block list;
+    mutable current_bbid: bbid;
   }
 
-  let create_context () = {
-    temp_counter = 0;
-    label_counter = 0;
-    symbol_table = Hashtbl.create 10;
+  let new_reg ctx = let i = ctx.reg_counter in ctx.reg_counter <- i + 1; R i
+  let new_bbid ctx = let i = ctx.bbid_counter in ctx.bbid_counter <- i + 1; L i
+
+  let create_ctx () = {
+    reg_counter = 0;
+    bbid_counter = 0;
+    var_map = Hashtbl.create 16;
+    current_block_instrs = [];
+    current_block_side_effects = [];
+    func_blocks = [];
+    current_bbid = L (-1); (* Invalid initial bbid *)
   }
 
-  (* Generates a new temporary register name, e.g., "%1" *)
-  let new_temp ctx =
-    let i = ctx.temp_counter in
-    ctx.temp_counter <- i + 1;
-    "%" ^ string_of_int i
+  (* Finalizes the current basic block and adds it to the function's list *)
+  let seal_block ctx term =
+    let new_block = {
+      id = ctx.current_bbid;
+      instrs = List.rev ctx.current_block_instrs;
+      side_effects = List.rev ctx.current_block_side_effects;
+      term = term;
+    } in
+    ctx.func_blocks <- new_block :: ctx.func_blocks;
+    ctx.current_block_instrs <- [];
+    ctx.current_block_side_effects <- [];
+    ()
 
-  (* Generates a new label name, e.g., "if.then.1" *)
-  let new_label ctx prefix =
-    let i = ctx.label_counter in
-    ctx.label_counter <- i + 1;
-    prefix ^ "." ^ string_of_int i
+  (* Starts a new basic block *)
+  let start_new_block ctx =
+    let bbid = new_bbid ctx in
+    ctx.current_bbid <- bbid;
+    bbid
 
-  (* Maps our AST binop to LLVM instruction and comparison predicate *)
+  let add_instr ctx def =
+    let reg = new_reg ctx in
+    let instr = { reg; def } in
+    ctx.current_block_instrs <- instr :: ctx.current_block_instrs;
+    reg
+
+  let add_side_effect ctx sei =
+    ctx.current_block_side_effects <- sei :: ctx.current_block_side_effects
+
+  let rec convert_expr ctx (expr: Ast.expr) : operand =
+    match expr with
+    | Cst i -> O_Cst i
+    | Id s ->
+        let ptr_reg = Hashtbl.find ctx.var_map s in
+        let res_reg = add_instr ctx (D_Load (O_Reg ptr_reg)) in
+        O_Reg res_reg
+    | BinOp (op, e1, e2) ->
+        let op1 = convert_expr ctx e1 in
+        let op2 = convert_expr ctx e2 in
+        let res_reg = add_instr ctx (D_BinOp (op, op1, op2)) in
+        O_Reg res_reg
+    | Call (name, args) ->
+        let arg_ops = List.map (convert_expr ctx) args in
+        let res_reg = add_instr ctx (D_Call (name, arg_ops)) in
+        O_Reg res_reg
+    | ArrayAccess (_, _) -> failwith "AST to SSA: Array access not implemented"
+
+  let rec convert_stmt ctx (stmt: Ast.stmt) : unit =
+    match stmt with
+    | Return e ->
+        let op = convert_expr ctx e in
+        seal_block ctx (T_Ret op)
+    | If (cond, then_s, else_s_opt) ->
+        let cond_op = convert_expr ctx cond in
+        let then_bbid = new_bbid ctx in
+        let else_bbid = new_bbid ctx in
+        let merge_bbid = new_bbid ctx in
+        let else_dest = match else_s_opt with Some _ -> else_bbid | None -> merge_bbid in
+
+        seal_block ctx (T_CBr (cond_op, then_bbid, else_dest));
+
+        (* Then block *)
+        ctx.current_bbid <- then_bbid;
+        convert_stmt ctx then_s;
+        seal_block ctx (T_Br merge_bbid);
+
+        (* Else block *)
+        (match else_s_opt with
+        | Some s ->
+            ctx.current_bbid <- else_bbid;
+            convert_stmt ctx s;
+            seal_block ctx (T_Br merge_bbid)
+        | None -> ());
+
+        (* Start new merge block *)
+        ctx.current_bbid <- merge_bbid
+
+    | Block stmts -> List.iter (convert_stmt ctx) stmts
+    | Decl (_, name, init_opt) ->
+        let ptr_reg = Hashtbl.find ctx.var_map name in (* Must have been pre-allocated *)
+        (match init_opt with
+         | Some e ->
+             let val_op = convert_expr ctx e in
+             add_side_effect ctx (S_Store (O_Reg ptr_reg, val_op))
+         | None -> ())
+    | Assign (lhs, rhs) ->
+        let rhs_op = convert_expr ctx rhs in
+        (match lhs with
+         | Id s ->
+             let ptr_reg = Hashtbl.find ctx.var_map s in
+             add_side_effect ctx (S_Store (O_Reg ptr_reg, rhs_op))
+         | _ -> failwith "AST to SSA: Assignment to non-variable not implemented")
+    | ExprStmt e ->
+        let _ = convert_expr ctx e in ()
+    | ArrayDecl _ -> failwith "AST to SSA: Array declaration not implemented"
+
+  let rec find_decls_in_stmt (stmt: Ast.stmt) : string list =
+    match stmt with
+    | Decl (_, name, _) -> [name]
+    | ArrayDecl (_, name, _) -> [name]
+    | If (_, then_s, else_s_opt) ->
+        let then_decls = find_decls_in_stmt then_s in
+        let else_decls = match else_s_opt with Some s -> find_decls_in_stmt s | None -> [] in
+        then_decls @ else_decls
+    | Block stmts -> List.concat_map find_decls_in_stmt stmts
+    | _ -> []
+
+  let convert_func (fdef: Ast.top_level_def) : Ssa.func_def =
+    let ctx = create_ctx () in
+
+    (* Start the entry block *)
+    let _ = start_new_block ctx in
+
+    (* Process parameters *)
+    let param_regs = List.map (fun (_, name) ->
+        let param_val_reg = new_reg ctx in (* This will hold the incoming value *)
+        let ptr_reg = add_instr ctx D_Alloca in
+        add_side_effect ctx (S_Store (O_Reg ptr_reg, O_Reg param_val_reg));
+        Hashtbl.add ctx.var_map name ptr_reg;
+        param_val_reg
+      ) fdef.params
+    in
+
+    (* Allocate space for all local variables *)
+    let local_vars = find_decls_in_stmt fdef.body in
+    List.iter (fun name ->
+        let ptr_reg = add_instr ctx D_Alloca in
+        Hashtbl.add ctx.var_map name ptr_reg;
+      ) local_vars;
+
+    (* Convert the function body *)
+    convert_stmt ctx fdef.body;
+
+    (* If the last block wasn't terminated, it implies the C function could
+       flow off the end without a return, which is undefined behavior.
+       We add a default return to make the IR well-formed. *)
+    if ctx.current_block_instrs <> [] || ctx.current_block_side_effects <> [] then begin
+       seal_block ctx (T_Ret (O_Cst 0))
+    end;
+
+    {
+      name = fdef.name;
+      params = param_regs;
+      blocks = List.rev ctx.func_blocks;
+    }
+
+  let convert_program (prog: Ast.program) : Ssa.program =
+    List.map convert_func prog
+end
+
+(* V. SSA IR Pretty Printer (for debugging) *)
+module Ssa_printer = struct
+  open Ssa
+
+  let string_of_reg (R i) = "%r" ^ string_of_int i
+  let string_of_bbid (L i) = "L" ^ string_of_int i
+  let string_of_operand = function
+    | O_Cst i -> string_of_int i
+    | O_Reg r -> string_of_reg r
+    | O_Global s -> "@" ^ s
+
   let string_of_binop = function
+    | Add -> "add" | Sub -> "sub" | Mul -> "mul" | Div -> "div"
+    | Le -> "le" | Eq -> "eq" | Ne -> "ne" | Lt -> "lt" | Gt -> "gt" | Ge -> "ge"
+
+  let string_of_definition def =
+    match def with
+    | D_BinOp (op, o1, o2) -> Printf.sprintf "%s %s, %s" (string_of_binop op) (string_of_operand o1) (string_of_operand o2)
+    | D_Call (name, args) -> Printf.sprintf "call @%s(%s)" name (String.concat ", " (List.map string_of_operand args))
+    | D_Phi phis -> "phi " ^ (String.concat ", " (List.map (fun (op, bbid) -> Printf.sprintf "[ %s, %s ]" (string_of_operand op) (string_of_bbid bbid)) phis))
+    | D_Alloca -> "alloca"
+    | D_Load op -> Printf.sprintf "load %s" (string_of_operand op)
+
+  let string_of_instruction instr =
+    Printf.sprintf "  %s = %s" (string_of_reg instr.reg) (string_of_definition instr.def)
+
+  let string_of_side_effect sei =
+    match sei with
+    | S_Store (addr, value) ->
+      Printf.sprintf "  store %s, %s" (string_of_operand value) (string_of_operand addr)
+
+  let string_of_terminator term =
+    "  " ^ match term with
+    | T_Ret op -> "ret " ^ string_of_operand op
+    | T_Br bbid -> "br " ^ string_of_bbid bbid
+    | T_CBr (cond, ltrue, lfalse) -> Printf.sprintf "cbr %s, %s, %s" (string_of_operand cond) (string_of_bbid ltrue) (string_of_bbid lfalse)
+
+  let string_of_basic_block bb =
+    let instrs_str = String.concat "\n" (List.map string_of_instruction bb.instrs) in
+    let side_effects_str = String.concat "\n" (List.map string_of_side_effect bb.side_effects) in
+    let parts = [string_of_bbid bb.id ^ ":"; instrs_str; side_effects_str; string_of_terminator bb.term] in
+    String.concat "\n" (List.filter (fun s -> s <> "") parts)
+
+  let string_of_func_def f =
+    let params_str = String.concat ", " (List.map string_of_reg f.params) in
+    let blocks_str = String.concat "\n\n" (List.map string_of_basic_block f.blocks) in
+    Printf.sprintf "define @%s(%s) {\n%s\n}" f.name params_str blocks_str
+
+  let string_of_program prog =
+    String.concat "\n\n" (List.map string_of_func_def prog)
+end
+
+(* VI. Code Generation (from SSA to LLVM IR) *)
+module Codegen = struct
+  open Ssa
+
+  let string_of_ssa_reg (R i) = "%r" ^ string_of_int i
+  let string_of_ssa_bbid (L i) = "L" ^ string_of_int i
+
+  let string_of_ssa_operand (op: operand) : string =
+    match op with
+    | O_Cst i -> string_of_int i
+    | O_Reg r -> string_of_ssa_reg r
+    | O_Global s -> "@" ^ s
+
+  let ll_binop = function
     | Add -> "add nsw"
     | Sub -> "sub nsw"
     | Mul -> "mul nsw"
@@ -278,225 +488,72 @@ module Codegen = struct
     | Eq  -> "icmp eq"
     | Ne  -> "icmp ne"
 
-  (* --- AST Traversal and Code Generation --- *)
-
-  (* codegen_expr: generates instructions for an expression.
-     Returns a pair: (list of instruction strings, result register/value name) *)
-  let rec codegen_expr ctx (expr: expr) : string list * string =
-    match expr with
-    | Cst i -> ([], string_of_int i)
-    | Id s ->
-        log ("Generating expr: Id(" ^ s ^ ")");
-        let ptr_name =
-          try Hashtbl.find ctx.symbol_table s
-          with Not_found -> failwith ("Codegen error: Unknown variable name: " ^ s)
-        in
-        let res_name = new_temp ctx in
-        let instr = Printf.sprintf "  %s = load i32, i32* %s, align 4" res_name ptr_name in
-        ([instr], res_name)
-    | BinOp (op, e1, e2) ->
-        log "Generating expr: BinOp";
-        let (instrs1, res1) = codegen_expr ctx e1 in
-        let (instrs2, res2) = codegen_expr ctx e2 in
-        let op_str = string_of_binop op in
+  let codegen_instr (instr: instruction) : string list =
+    let dest_reg = string_of_ssa_reg instr.reg in
+    match instr.def with
+    | D_BinOp (op, o1, o2) ->
+        let op_str = ll_binop op in
+        let s_op1 = string_of_ssa_operand o1 in
+        let s_op2 = string_of_ssa_operand o2 in
         let is_comparison = match op with Lt|Le|Gt|Ge|Eq|Ne -> true | _ -> false in
         if is_comparison then
-          (* Comparisons produce an i1, which we must extend to i32 (0 or 1) for C semantics *)
-          let i1_res = new_temp ctx in
-          let cmp_instr = Printf.sprintf "  %s = %s i32 %s, %s" i1_res op_str res1 res2 in
-          let res_name = new_temp ctx in
-          let zext_instr = Printf.sprintf "  %s = zext i1 %s to i32" res_name i1_res in
-          (instrs1 @ instrs2 @ [cmp_instr; zext_instr], res_name)
+          let i1_res = dest_reg ^ ".i1" in
+          let cmp_instr = Printf.sprintf "  %s = %s i32 %s, %s" i1_res op_str s_op1 s_op2 in
+          let zext_instr = Printf.sprintf "  %s = zext i1 %s to i32" dest_reg i1_res in
+          [cmp_instr; zext_instr]
         else
-          (* Arithmetic operations produce an i32 directly *)
-          let res_name = new_temp ctx in
-          let instr = Printf.sprintf "  %s = %s i32 %s, %s" res_name op_str res1 res2 in
-          (instrs1 @ instrs2 @ [instr], res_name)
-    | Call (name, args) ->
-        log ("Generating expr: Call to '" ^ name ^ "'");
-        let (arg_instrs, arg_ress) =
-          List.fold_left (fun (acc_instrs, acc_ress) arg_expr ->
-            let (instrs, res) = codegen_expr ctx arg_expr in
-            (acc_instrs @ instrs, acc_ress @ [res])
-          ) ([], []) args
-        in
-        let args_str = String.concat ", " (List.map (fun r -> "i32 " ^ r) arg_ress) in
-        let res_name = new_temp ctx in
-        let instr = Printf.sprintf "  %s = call i32 @%s(%s)" res_name name args_str in
-        (arg_instrs @ [instr], res_name)
-    | ArrayAccess (_, _) -> failwith "Array access codegen not yet implemented"
+          [Printf.sprintf "  %s = %s i32 %s, %s" dest_reg op_str s_op1 s_op2]
+    | D_Call (name, args) ->
+        let arg_strs = List.map (fun op -> "i32 " ^ string_of_ssa_operand op) args in
+        [Printf.sprintf "  %s = call i32 @%s(%s)" dest_reg name (String.concat ", " arg_strs)]
+    | D_Phi _ -> failwith "LLVM Codegen: Phi nodes not supported in this simplified compiler"
+    | D_Alloca ->
+        [Printf.sprintf "  %s = alloca i32, align 4" dest_reg]
+    | D_Load addr_op ->
+        let s_addr = string_of_ssa_operand addr_op in
+        [Printf.sprintf "  %s = load i32, i32* %s, align 4" dest_reg s_addr]
 
-  (* Helper to check if a list of instructions is terminated by a 'ret' or 'br' *)
-  let has_terminator instrs =
-    match List.rev instrs with
-    | [] -> false
-    | last :: _ ->
-        let trimmed = String.trim last in
-        String.starts_with ~prefix:"ret " trimmed || String.starts_with ~prefix:"br " trimmed || String.starts_with ~prefix:"unreachable" trimmed
+  let codegen_side_effect (sei: side_effect_instr) : string =
+    match sei with
+    | S_Store (addr_op, val_op) ->
+        let s_addr = string_of_ssa_operand addr_op in
+        let s_val = string_of_ssa_operand val_op in
+        Printf.sprintf "  store i32 %s, i32* %s, align 4" s_val s_addr
 
-  (* codegen_stmt: generates a list of instruction strings for a statement. *)
-  let rec codegen_stmt ctx (stmt: stmt) : string list =
-    match stmt with
-    | Block stmts ->
-        log "Generating stmt: Block";
-        List.concat_map (codegen_stmt ctx) stmts
-    | ExprStmt e ->
-        log "Generating stmt: ExprStmt";
-        let (instrs, _) = codegen_expr ctx e in
-        instrs
-    | Return e ->
-        log "Generating stmt: Return";
-        let (instrs, res) = codegen_expr ctx e in
-        instrs @ [Printf.sprintf "  ret i32 %s" res]
-    | If (cond, then_s, else_s_opt) ->
-        log "Generating stmt: If";
-        let (cond_instrs, cond_res) = codegen_expr ctx cond in
-        (* In C, any non-zero value is true. LLVM's `br` needs an `i1`. *)
-        let i1_res = new_temp ctx in
-        let cmp_instr = Printf.sprintf "  %s = icmp ne i32 %s, 0" i1_res cond_res in
+  let codegen_terminator (term: terminator) : string list =
+    match term with
+    | T_Ret op -> [Printf.sprintf "  ret i32 %s" (string_of_ssa_operand op)]
+    | T_Br bbid -> [Printf.sprintf "  br label %%%s" (string_of_ssa_bbid bbid)]
+    | T_CBr (cond_op, ltrue, lfalse) ->
+        let s_cond = string_of_ssa_operand cond_op in
+        let i1_res = s_cond ^ ".i1" in
+        let cmp_instr = Printf.sprintf "  %s = icmp ne i32 %s, 0" i1_res s_cond in
+        let br_instr = Printf.sprintf "  br i1 %s, label %%%s, label %%%s" i1_res (string_of_ssa_bbid ltrue) (string_of_ssa_bbid lfalse) in
+        [cmp_instr; br_instr]
 
-        let then_label = new_label ctx "if.then" in
-        let else_label = new_label ctx "if.else" in
-        let end_label = new_label ctx "if.end" in
-        let else_dest = match else_s_opt with Some _ -> else_label | None -> end_label in
+  let codegen_bb (bb: basic_block) : string list =
+    let label = (string_of_ssa_bbid bb.id) ^ ":" in
+    let instrs = List.concat_map codegen_instr bb.instrs in
+    let side_effects = List.map codegen_side_effect bb.side_effects in
+    let term = codegen_terminator bb.term in
+    [label] @ instrs @ side_effects @ term
 
-        let br_instr = Printf.sprintf "  br i1 %s, label %%%s, label %%%s" i1_res then_label else_dest in
+  let codegen_func (f: func_def) : string =
+    let param_strs = List.map (fun r -> "i32 " ^ string_of_ssa_reg r) f.params in
+    let signature = Printf.sprintf "define i32 @%s(%s) {" f.name (String.concat ", " param_strs) in
+    let body_lines = List.concat_map codegen_bb f.blocks in
+    String.concat "\n" ([signature] @ body_lines @ ["}"])
 
-        let then_instrs = codegen_stmt ctx then_s in
-        let then_block =
-          (then_label ^ ":") :: then_instrs @
-          (if has_terminator then_instrs then [] else [Printf.sprintf "  br label %%%s" end_label])
-        in
-
-        let else_block, needs_end_label =
-          match else_s_opt with
-          | Some s ->
-              let else_instrs = codegen_stmt ctx s in (* This could be a single expression, no need for new variable *)
-              let block = (else_label ^ ":") :: else_instrs @
-                          (if has_terminator else_instrs then [] else [Printf.sprintf "  br label %%%s" end_label])
-              in (block, true)
-          | None -> ([], true) (* The 'false' path of the initial branch jumps to the end label, so it must be emitted. *)
-        in
-        let end_block = if needs_end_label then [end_label ^ ":"] else [] in
-
-        cond_instrs @ [cmp_instr; br_instr] @ then_block @ else_block @ end_block
-
-    (* NOTE: `alloca`s are handled in `codegen_func_def` to ensure they are in the entry block.
-       This function only handles the initialization store. *)
-    | Decl (_, name, init_opt) ->
-        log ("Generating stmt: Decl for var '" ^ name ^ "'");
-        (match init_opt with
-        | Some e ->
-            log (" -> Generating initializer for '" ^ name ^ "'");
-            let (instrs, res) = codegen_expr ctx e in
-            let ptr_name = Hashtbl.find ctx.symbol_table name in
-            let store_instr = Printf.sprintf "  store i32 %s, i32* %s, align 4" res ptr_name in
-            instrs @ [store_instr]
-        | None -> [])
-    | ArrayDecl _ -> failwith "Array declaration codegen not yet implemented"
-    | Assign (lhs, rhs) ->
-        log "Generating stmt: Assign";
-        let ptr_name = match lhs with
-          | Id s ->
-              (try Hashtbl.find ctx.symbol_table s
-               with Not_found -> failwith ("Undeclared variable for assignment: " ^ s))
-          | _ -> failwith "LHS of assignment must be a variable"
-        in
-        let (rhs_instrs, rhs_res) = codegen_expr ctx rhs in
-        let store_instr = Printf.sprintf "  store i32 %s, i32* %s, align 4" rhs_res ptr_name in
-        rhs_instrs @ [store_instr]
-
-  (* Traverses the AST of a function body to find all local variable declarations. *)
-  let rec find_decls_in_stmt (stmt: stmt) : (string * string) list =
-    match stmt with
-    | Decl (typ, name, _) -> [(typ, name)]
-    | ArrayDecl (typ, name, _) -> [(typ, name)]
-    | If (_, then_s, else_s_opt) ->
-        let then_decls = find_decls_in_stmt then_s in
-        let else_decls = match else_s_opt with Some s -> find_decls_in_stmt s | None -> [] in
-        then_decls @ else_decls
-    | Block stmts -> List.concat_map find_decls_in_stmt stmts
-    | _ -> []
-
-  let codegen_func_def (fdef: top_level_def) : string =
-    log ("--- Defining function: " ^ fdef.name ^ " ---");
-    let ctx = create_context () in
-
-    (* 1. Generate function signature *)
-    let params_str =
-      String.concat ", " (List.map (fun (_, n) -> "i32 %" ^ n) fdef.params) in
-    let signature = Printf.sprintf "define i32 @%s(%s) {" fdef.name params_str in
-
-    (* 2. Create entry block instructions *)
-    let entry_block_label = ["entry:"] in
-
-    (* `alloca` and `store` for parameters *)
-    let param_setup_instrs =
-      List.concat_map (fun (_, name) ->
-        let ptr_name = "%" ^ name ^ ".addr" in
-        Hashtbl.add ctx.symbol_table name ptr_name;
-        [ Printf.sprintf "  %s = alloca i32, align 4" ptr_name;
-          Printf.sprintf "  store i32 %%%s, i32* %s, align 4" name ptr_name ]
-      ) fdef.params
-    in
-
-    (* `alloca` for all local variables found in the function body *)
-    let local_decls = find_decls_in_stmt fdef.body in
-    let local_allocas =
-      List.map (fun (_, name) ->
-        let ptr_name = "%" ^ name ^ ".addr" in
-        Hashtbl.add ctx.symbol_table name ptr_name;
-        Printf.sprintf "  %s = alloca i32, align 4" ptr_name
-      ) local_decls
-    in
-    
-    let initial_allocas = param_setup_instrs @ local_allocas in
-    (* Jump from entry to the first real block of code *)
-    let code_label = new_label ctx "code.start" in
-    let entry_branch = [Printf.sprintf "  br label %%%s" code_label] in
-    let first_code_block_label = [code_label ^ ":"] in
-
-    (* 3. Generate code for the function body statements *)
-    log " -> Generating function body";
-    let body_instrs = codegen_stmt ctx fdef.body in
-
-    (* Add a terminator if the function doesn't end with one *)
-    let final_body =
-      if has_terminator body_instrs then body_instrs
-      else begin
-        log " -> Block not terminated, adding unreachable.";
-        body_instrs @ ["  unreachable"]
-      end
-    in
-
-    (* 4. Assemble the full function string *)
-    let all_lines =
-      [signature]
-      @ entry_block_label
-      @ initial_allocas
-      @ entry_branch
-      @ first_code_block_label
-      @ final_body
-      @ ["}"]
-    in
-    log ("--- Finished function: " ^ fdef.name ^ " ---");
-    String.concat "\n" all_lines
-
-
-  let codegen_program (prog: program) : (string, string) result =
+  let codegen_program (prog: Ssa.program) : (string, string) result =
     try
-        log "Starting codegen for program";
-        let func_defs = List.map codegen_func_def prog in
+        let func_defs = List.map codegen_func prog in
         let full_module = String.concat "\n\n" func_defs in
-        log "Codegen program finished.";
         Ok full_module
     with
     | Failure msg -> Error ("Codegen failed: " ^ msg)
-
 end
 
-(* V. AST Pretty Printer (for debugging) *)
-
+(* VII. AST Pretty Printer (for debugging) *)
 let rec string_of_expr = function
   | Cst n -> string_of_int n | Id s -> s
   | BinOp (op, e1, e2) ->
@@ -525,13 +582,15 @@ let string_of_def (d: top_level_def) =
 let string_of_program (p: program) = String.concat "\n\n" (List.map string_of_def p)
 
 
-(* VI. Main Driver *)
+(* VIII. Main Driver *)
 let () =
   let input_code = "
     int fac(int n) {
+      int unused_declaration; // This alloca should be removed by DCE
       if (n <= 1) {
         return 1;
       }
+      int dead = 42; // This should be removed by DCE
       return n * fac(n-1);
     }
 
@@ -558,15 +617,29 @@ let () =
       print_endline (string_of_program ast);
       print_endline "\n--------------------------\n";
 
-      (* --- Phase 2: Code Generation --- *)
-      print_endline "PHASE 2: Generating LLVM IR...";
-      match Codegen.codegen_program ast with
+      (* --- Phase 2: AST to SSA Conversion --- *)
+      print_endline "PHASE 2: Converting AST to SSA IR...";
+      let ssa_ir = Ast_to_ssa.convert_program ast in
+      print_endline "Successfully generated SSA IR:";
+      print_endline (Ssa_printer.string_of_program ssa_ir);
+      print_endline "\n--------------------------\n";
+
+      (* --- Phase 3: Dead Code Elimination --- *)
+      print_endline "PHASE 3: Running Dead Code Elimination...";
+      let optimized_ssa_ir = List.map Dce.run_on_function ssa_ir in
+      print_endline "SSA IR after DCE:";
+      print_endline (Ssa_printer.string_of_program optimized_ssa_ir);
+      print_endline "\n--------------------------\n";
+
+      (* --- Phase 4: Code Generation from SSA --- *)
+      print_endline "PHASE 4: Generating LLVM IR from SSA...";
+      match Codegen.codegen_program optimized_ssa_ir with
       | Error msg ->
           print_endline ("Codegen failed: " ^ msg);
           exit 1
       | Ok ir_string ->
-          (* --- Phase 3: Output --- *)
-          print_endline "Successfully generated LLVM IR:";
+          (* --- Phase 5: Output --- *)
+          print_endline "Successfully generated LLVM IR from optimized SSA:";
           print_endline ir_string;
 
           (* Write to a file *)
