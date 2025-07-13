@@ -51,6 +51,7 @@ type token =
   | T_Lparen | T_Rparen (* ( ) *)
   | T_Lbrace | T_Rbrace (* { } *)
   | T_Comma
+  | T_Semicolon
   (* End of File *)
   | T_Eof
 
@@ -94,6 +95,7 @@ let token_specs = [
   (Str.regexp "{", fun _ -> Some T_Lbrace);
   (Str.regexp "}", fun _ -> Some T_Rbrace);
   (Str.regexp ",", fun _ -> Some T_Comma);
+  (Str.regexp ";", fun _ -> Some T_Semicolon);
 ]
 
 let tokenize str =
@@ -127,6 +129,7 @@ let expect token tokens =
         (match token with
          | T_Lparen -> "'('" | T_Rparen -> "')'" | T_Lbrace -> "'{'"
          | T_Rbrace -> "'}'" | T_Comma -> "','" | T_Int -> "'int'"
+         | T_Semicolon -> "';'"
          | _ -> "token")
         (match t with
          | T_Id s -> "identifier " ^ s | T_Num n -> "number " ^ string_of_int n
@@ -174,7 +177,8 @@ and parse_stmt tokens =
   match tokens with
   | T_Return :: rest ->
       let (expr, rest') = parse_expr rest in
-      (Return expr, rest')
+      let rest'' = expect T_Semicolon rest' in
+      (Return expr, rest'')
   | T_If :: rest ->
       let rest1 = expect T_Lparen rest in
       let (cond, rest2) = parse_expr rest1 in
