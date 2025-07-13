@@ -1,4 +1,4 @@
 (executable
  (public_name mini-c-parser)
  (name main)
- (libraries str llvm))
+ (libraries str llvm llvm.analysis))
