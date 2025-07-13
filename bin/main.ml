@@ -135,7 +135,7 @@ let expect token tokens =
   | [] -> failwith "Parser error: Unexpected end of input"
 
 (* 主解析函数 *)
-let rec parse_program tokens =
+let rec parse_program tokens : program * token list =
   match tokens with
   | [T_Eof] -> ([], [])
   | _ ->
@@ -322,15 +322,15 @@ let rec string_of_stmt indent = function
       (String.concat "\n" (List.map (string_of_stmt (indent ^ "  ")) stmts)) ^
       "\n" ^ indent ^ "}"
 
-let string_of_def d =
+let string_of_def (d : top_level_def) =
   let params_str = String.concat ", " (List.map (fun (t, n) -> t ^ " " ^ n) d.params) in
   Printf.sprintf "Function %s %s(%s)\n%s" d.ret_type d.name params_str (string_of_stmt "" d.body)
 
-let string_of_program p =
+let string_of_program (p : program) =
   String.concat "\n\n" (List.map string_of_def p)
 
 (* V. Main Function: string -> AST *)
-let parse_from_string str =
+let parse_from_string str : (program, string) result =
   try
     let tokens = tokenize str in
     let (ast, rest_tokens) = parse_program tokens in
