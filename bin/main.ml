@@ -5,18 +5,19 @@
   =================================
 
   To compile and run:
-  1. Install LLVM bindings: `opam install llvm`
-  2. Compile: `ocamlfind ocamlopt -package llvm -linkpkg -o compiler main.ml`
-     (or `ocamlbuild -use-ocamlfind -pkg llvm compiler.native`)
+  1. Make sure you have the 'str' library (usually included with OCaml).
+     If not: `opam install str`
+  2. Compile: `ocamlfind ocamlopt -package str -linkpkg -o compiler main.ml`
+     (or `ocamlbuild -use-ocamlfind -pkg str compiler.native`)
   3. Run: `./compiler`
 
   The program will parse the hardcoded C source, print the AST,
-  and then print the generated LLVM IR.
+  and then print the generated LLVM IR as a string.
 *)
 
 
 (* I. AST Definition *)
-(* (与你提供的代码相同) *)
+(* (Unaltered) *)
 
 (* 操作符类型 *)
 type binop =
@@ -59,7 +60,7 @@ type program = top_level_def list
 
 
 (* II. Tokenizer (Lexer) *)
-(* (与你提供的代码相同) *)
+(* (Unaltered) *)
 
 type token =
   | T_Int | T_Return | T_If | T_Else | T_Id of string | T_Num of int
@@ -100,7 +101,7 @@ let tokenize str =
   in next_token 0
 
 (* III. Parser *)
-(* (与你提供的代码大部分相同, 修复了一个小 bug 并且让它更健壮) *)
+(* (Unaltered) *)
 
 exception Parser_error of string
 
@@ -273,218 +274,264 @@ let parse_from_string str =
   | Parser_error msg -> Error ("Parser error: " ^ msg)
   | Failure msg -> Error ("Lexer/Parser failure: " ^ msg)
 
-(* IV. Code Generation (to LLVM IR) *)
+(* IV. Code Generation (to LLVM IR as String) *)
 
 module Codegen = struct
   (* Helper for logging *)
   let log msg = print_endline ("[Codegen] " ^ msg)
 
-  let the_context = Llvm.global_context ()
-  let the_module = Llvm.create_module the_context "mini-c-compiler"
-  let builder = Llvm.builder the_context
-  let i32_type = Llvm.i32_type the_context
-  let void_type = Llvm.void_type the_context
+  (* --- State Management for Code Generation --- *)
+  type codegen_context = {
+    mutable temp_counter: int;          (* For generating unique temporary register names, e.g., %1, %2 *)
+    mutable label_counter: int;         (* For generating unique label names, e.g., if.then1, if.end2 *)
+    symbol_table: (string, string) Hashtbl.t; (* Maps C var names to LLVM pointer names, e.g., "n" -> "%n.addr" *)
+  }
 
-  (* 符号表: 存储变量名到其在栈上的地址 (llvalue) *)
-  (* A new symbol table is created for each function. *)
-  let named_values : (string, Llvm.llvalue) Hashtbl.t = Hashtbl.create 10
+  let create_context () = {
+    temp_counter = 0;
+    label_counter = 0;
+    symbol_table = Hashtbl.create 10;
+  }
 
-  (* Helper to get a function's LLVM type *)
-  let get_llvm_type = function
-    | "int" -> i32_type
-    | "void" -> void_type (* For future use *)
-    | _ -> failwith "Unsupported type"
+  (* Generates a new temporary register name, e.g., "%1" *)
+  let new_temp ctx =
+    let i = ctx.temp_counter in
+    ctx.temp_counter <- i + 1;
+    "%" ^ string_of_int i
 
-  (* Look up a function in the module, error if not found. *)
-  let get_function name =
-    log ("Looking up function: " ^ name);
-    match Llvm.lookup_function name the_module with
-    | Some f -> log ("Found function: " ^ name); f
-    | None -> failwith ("Codegen error: Unknown function referenced: " ^ name)
+  (* Generates a new label name, e.g., "if.then.1" *)
+  let new_label ctx prefix =
+    let i = ctx.label_counter in
+    ctx.label_counter <- i + 1;
+    prefix ^ "." ^ string_of_int i
 
-  let rec codegen_expr expr =
+  (* Maps our AST binop to LLVM instruction and comparison predicate *)
+  let string_of_binop = function
+    | Add -> "add nsw"
+    | Sub -> "sub nsw"
+    | Mul -> "mul nsw"
+    | Div -> "sdiv"
+    | Lt  -> "icmp slt"
+    | Le  -> "icmp sle"
+    | Gt  -> "icmp sgt"
+    | Ge  -> "icmp sge"
+    | Eq  -> "icmp eq"
+    | Ne  -> "icmp ne"
+
+  (* --- AST Traversal and Code Generation --- *)
+
+  (* codegen_expr: generates instructions for an expression.
+     Returns a pair: (list of instruction strings, result register/value name) *)
+  let rec codegen_expr ctx (expr: expr) : string list * string =
     match expr with
-    | Cst i -> Llvm.const_int i32_type i
+    | Cst i -> ([], string_of_int i)
     | Id s ->
         log ("Generating expr: Id(" ^ s ^ ")");
-        let ptr = try Hashtbl.find named_values s
-                  with Not_found -> failwith ("Codegen error: Unknown variable name: " ^ s) in
-        (* Load the value from the stack pointer *)
-        log (" -> Found var '" ^ s ^ "', loading from pointer.");
-        Llvm.build_load i32_type ptr s builder
+        let ptr_name =
+          try Hashtbl.find ctx.symbol_table s
+          with Not_found -> failwith ("Codegen error: Unknown variable name: " ^ s)
+        in
+        let res_name = new_temp ctx in
+        let instr = Printf.sprintf "  %s = load i32, ptr %s, align 4" res_name ptr_name in
+        ([instr], res_name)
     | BinOp (op, e1, e2) ->
         log "Generating expr: BinOp";
-        let v1 = codegen_expr e1 in
-        let v2 = codegen_expr e2 in
-        log " -> Operands generated, building instruction.";
-        (match op with
-        | Add -> Llvm.build_add v1 v2 "addtmp" builder
-        | Sub -> Llvm.build_sub v1 v2 "subtmp" builder
-        | Mul -> Llvm.build_mul v1 v2 "multmp" builder
-        | Div -> Llvm.build_sdiv v1 v2 "divtmp" builder
-        | Lt -> Llvm.build_icmp Llvm.Icmp.Slt v1 v2 "cmptmp" builder
-        | Le -> Llvm.build_icmp Llvm.Icmp.Sle v1 v2 "cmptmp" builder
-        | Gt -> Llvm.build_icmp Llvm.Icmp.Sgt v1 v2 "cmptmp" builder
-        | Ge -> Llvm.build_icmp Llvm.Icmp.Sge v1 v2 "cmptmp" builder
-        | Eq -> Llvm.build_icmp Llvm.Icmp.Eq v1 v2 "cmptmp" builder
-        | Ne -> Llvm.build_icmp Llvm.Icmp.Ne v1 v2 "cmptmp" builder
-        )
+        let (instrs1, res1) = codegen_expr ctx e1 in
+        let (instrs2, res2) = codegen_expr ctx e2 in
+        let op_str = string_of_binop op in
+        let res_name = new_temp ctx in
+        let is_comparison = match op with Lt|Le|Gt|Ge|Eq|Ne -> true | _ -> false in
+        if is_comparison then
+          (* Comparisons produce an i1, which we must extend to i32 (0 or 1) for C semantics *)
+          let i1_res = new_temp ctx in
+          let cmp_instr = Printf.sprintf "  %s = %s i32 %s, %s" i1_res op_str res1 res2 in
+          let zext_instr = Printf.sprintf "  %s = zext i1 %s to i32" res_name i1_res in
+          (instrs1 @ instrs2 @ [cmp_instr; zext_instr], res_name)
+        else
+          (* Arithmetic operations produce an i32 directly *)
+          let instr = Printf.sprintf "  %s = %s i32 %s, %s" res_name op_str res1 res2 in
+          (instrs1 @ instrs2 @ [instr], res_name)
     | Call (name, args) ->
         log ("Generating expr: Call to '" ^ name ^ "'");
-        let callee = get_function name in
-        let arg_vals = Array.of_list (List.map codegen_expr args) in
-        (* The function value 'callee' already has its type associated with it.
-           We can call it directly. The 'build_call2' function is needed if
-           the type and value are separate (e.g., for function pointer casting). *)
-        log (" -> Arguments generated. Building call instruction for '" ^ name ^ "'");
-        Llvm.build_call callee arg_vals "calltmp" builder
+        let (arg_instrs, arg_ress) =
+          List.fold_left (fun (acc_instrs, acc_ress) arg_expr ->
+            let (instrs, res) = codegen_expr ctx arg_expr in
+            (acc_instrs @ instrs, acc_ress @ [res])
+          ) ([], []) args
+        in
+        let args_str = String.concat ", " (List.map (fun r -> "i32 " ^ r) arg_ress) in
+        let res_name = new_temp ctx in
+        let instr = Printf.sprintf "  %s = call i32 @%s(%s)" res_name name args_str in
+        (arg_instrs @ [instr], res_name)
     | ArrayAccess (_, _) -> failwith "Array access codegen not yet implemented"
 
-  let rec codegen_stmt stmt =
+  (* Helper to check if a list of instructions is terminated by a 'ret' or 'br' *)
+  let has_terminator instrs =
+    match List.rev instrs with
+    | [] -> false
+    | last :: _ ->
+        let trimmed = String.trim last in
+        String.starts_with ~prefix:"ret " trimmed || String.starts_with ~prefix:"br " trimmed || String.starts_with ~prefix:"unreachable" trimmed
+
+  (* codegen_stmt: generates a list of instruction strings for a statement. *)
+  let rec codegen_stmt ctx (stmt: stmt) : string list =
     match stmt with
     | Block stmts ->
         log "Generating stmt: Block";
-        List.iter codegen_stmt stmts
+        List.concat_map (codegen_stmt ctx) stmts
     | ExprStmt e ->
         log "Generating stmt: ExprStmt";
-        ignore (codegen_expr e)
+        let (instrs, _) = codegen_expr ctx e in
+        instrs
     | Return e ->
         log "Generating stmt: Return";
-        ignore (Llvm.build_ret (codegen_expr e) builder)
+        let (instrs, res) = codegen_expr ctx e in
+        instrs @ [Printf.sprintf "  ret i32 %s" res]
     | If (cond, then_s, else_s_opt) ->
         log "Generating stmt: If";
-        let cond_val = codegen_expr cond in
-        (* C booleans are 0 (false) or non-zero (true). LLVM needs i1. *)
-        let zero = Llvm.const_int i32_type 0 in
-        let bool_val = Llvm.build_icmp Llvm.Icmp.Ne cond_val zero "ifcond" builder in
+        let (cond_instrs, cond_res) = codegen_expr ctx cond in
+        (* In C, any non-zero value is true. LLVM's `br` needs an `i1`. *)
+        let i1_res = new_temp ctx in
+        let cmp_instr = Printf.sprintf "  %s = icmp ne i32 %s, 0" i1_res cond_res in
 
-        (* Get the current function to append blocks to. *)
-        let start_bb = Llvm.insertion_block builder in
-        let the_function = Llvm.block_parent start_bb in
+        let then_label = new_label ctx "if.then" in
+        let else_label = new_label ctx "if.else" in
+        let end_label = new_label ctx "if.end" in
+        let else_dest = match else_s_opt with Some _ -> else_label | None -> end_label in
 
-        let then_bb = Llvm.append_block the_context "then" the_function in
-        let else_bb = Llvm.append_block the_context "else" the_function in
-        let merge_bb = Llvm.append_block the_context "ifcont" the_function in
+        let br_instr = Printf.sprintf "  br i1 %s, label %%%s, label %%%s" i1_res then_label else_dest in
 
-        (* Create the conditional branch. *)
-        log " -> Building conditional branch";
-        ignore (Llvm.build_cond_br bool_val then_bb else_bb builder);
+        let then_instrs = codegen_stmt ctx then_s in
+        let then_block =
+          (then_label ^ ":") :: then_instrs @
+          (if has_terminator then_instrs then [] else [Printf.sprintf "  br label %%%s" end_label])
+        in
 
-        (* Emit 'then' block. *)
-        log " -> Generating 'then' block";
-        Llvm.position_at_end then_bb builder;
-        codegen_stmt then_s;
-        if Llvm.block_terminator (Llvm.insertion_block builder) = None then
-            ignore (Llvm.build_br merge_bb builder);
+        let else_block, needs_end_label =
+          match else_s_opt with
+          | Some s ->
+              let else_instrs = codegen_stmt ctx s in
+              let block = (else_label ^ ":") :: else_instrs @
+                          (if has_terminator else_instrs then [] else [Printf.sprintf "  br label %%%s" end_label])
+              in (block, true)
+          | None -> ([], not (has_terminator then_instrs))
+        in
+        let end_block = if needs_end_label then [end_label ^ ":"] else [] in
 
-        (* Emit 'else' block. *)
-        log " -> Generating 'else' block";
-        Llvm.position_at_end else_bb builder;
-        (match else_s_opt with
-        | Some s -> codegen_stmt s
-        | None -> ());
-        if Llvm.block_terminator (Llvm.insertion_block builder) = None then
-            ignore (Llvm.build_br merge_bb builder);
+        cond_instrs @ [cmp_instr; br_instr] @ then_block @ else_block @ end_block
 
-        (* Reposition builder to the merge block. *)
-        log " -> Moving to 'merge' block";
-        Llvm.position_at_end merge_bb builder
-
+    (* NOTE: `alloca`s are handled in `codegen_func_def` to ensure they are in the entry block.
+       This function only handles the initialization store. *)
     | Decl (_, name, init_opt) ->
         log ("Generating stmt: Decl for var '" ^ name ^ "'");
-        (* Create an alloca for the local variable in the function's entry block. *)
-        let func = Llvm.block_parent (Llvm.insertion_block builder) in
-        let entry_builder = Llvm.builder_at_end the_context (Llvm.entry_block func) in
-        let alloca = Llvm.build_alloca i32_type name entry_builder in
-        Hashtbl.add named_values name alloca;
-        log (" -> Allocated '" ^ name ^ "' on stack");
-
-        (* If there's an initializer, store its value. *)
         (match init_opt with
         | Some e ->
             log (" -> Generating initializer for '" ^ name ^ "'");
-            let init_val = codegen_expr e in
-            ignore (Llvm.build_store init_val alloca builder)
-        | None -> ())
+            let (instrs, res) = codegen_expr ctx e in
+            let ptr_name = Hashtbl.find ctx.symbol_table name in
+            let store_instr = Printf.sprintf "  store i32 %s, ptr %s, align 4" res ptr_name in
+            instrs @ [store_instr]
+        | None -> [])
     | ArrayDecl _ -> failwith "Array declaration codegen not yet implemented"
     | Assign (lhs, rhs) ->
         log "Generating stmt: Assign";
-        let value_to_store = codegen_expr rhs in
-        let ptr = match lhs with
+        let ptr_name = match lhs with
           | Id s ->
-              (try Hashtbl.find named_values s
+              (try Hashtbl.find ctx.symbol_table s
                with Not_found -> failwith ("Undeclared variable for assignment: " ^ s))
           | _ -> failwith "LHS of assignment must be a variable"
         in
-        log " -> Storing value to pointer";
-        ignore (Llvm.build_store value_to_store ptr builder)
+        let (rhs_instrs, rhs_res) = codegen_expr ctx rhs in
+        let store_instr = Printf.sprintf "  store i32 %s, ptr %s, align 4" rhs_res ptr_name in
+        rhs_instrs @ [store_instr]
 
-  let codegen_func_def (fdef: top_level_def) =
+  (* Traverses the AST of a function body to find all local variable declarations. *)
+  let rec find_decls_in_stmt (stmt: stmt) : (string * string) list =
+    match stmt with
+    | Decl (typ, name, _) -> [(typ, name)]
+    | ArrayDecl (typ, name, _) -> [(typ, name)]
+    | If (_, then_s, else_s_opt) ->
+        let then_decls = find_decls_in_stmt then_s in
+        let else_decls = match else_s_opt with Some s -> find_decls_in_stmt s | None -> [] in
+        then_decls @ else_decls
+    | Block stmts -> List.concat_map find_decls_in_stmt stmts
+    | _ -> []
+
+  let codegen_func_def (fdef: top_level_def) : string =
     log ("--- Defining function: " ^ fdef.name ^ " ---");
-    Hashtbl.clear named_values; (* Clear symbol table for new function *)
+    let ctx = create_context () in
 
-    let the_function = get_function fdef.name in
-    let bb = Llvm.append_block the_context "entry" the_function in
-    Llvm.position_at_end bb builder;
+    (* 1. Generate function signature *)
+    let params_str =
+      String.concat ", " (List.map (fun (_, n) -> "i32 %" ^ n) fdef.params) in
+    let signature = Printf.sprintf "define i32 @%s(%s) {" fdef.name params_str in
 
-    (* Create a builder that always inserts at the top of the entry block.
-       All allocas must be placed here. *)
-    let entry_builder = Llvm.builder_at_end the_context (Llvm.entry_block the_function) in
+    (* 2. Create entry block instructions *)
+    let entry_block_label = ["entry:"] in
 
-    log " -> Allocating and storing parameters";
-    (* Allocate space for all parameters and store their initial values *)
-    Array.iteri (fun i param_ll ->
-      let (param_type, param_name) = List.nth fdef.params i in
-      log ("    - Param: " ^ param_name);
-      Llvm.set_value_name param_name param_ll;
-      (* Create the alloca in the entry block using the entry_builder *)
-      let alloca = Llvm.build_alloca (get_llvm_type param_type) param_name entry_builder in
-      (* The store instruction happens at the current position of the main builder *)
-      ignore (Llvm.build_store param_ll alloca builder);
-      Hashtbl.add named_values param_name alloca
-    ) (Llvm.params the_function);
+    (* `alloca` and `store` for parameters *)
+    let param_setup_instrs =
+      List.concat_map (fun (_, name) ->
+        let ptr_name = "%" ^ name ^ ".addr" in
+        Hashtbl.add ctx.symbol_table name ptr_name;
+        [ Printf.sprintf "  %s = alloca i32, align 4" ptr_name;
+          Printf.sprintf "  store i32 %%%s, ptr %s, align 4" name ptr_name ]
+      ) fdef.params
+    in
 
+    (* `alloca` for all local variables found in the function body *)
+    let local_decls = find_decls_in_stmt fdef.body in
+    let local_allocas =
+      List.map (fun (_, name) ->
+        let ptr_name = "%" ^ name ^ ".addr" in
+        Hashtbl.add ctx.symbol_table name ptr_name;
+        Printf.sprintf "  %s = alloca i32, align 4" ptr_name
+      ) local_decls
+    in
+    
+    let initial_allocas = param_setup_instrs @ local_allocas in
+    (* Jump from entry to the first real block of code *)
+    let code_label = new_label ctx "code.start" in
+    let entry_branch = [Printf.sprintf "  br label %%%s" code_label] in
+    let first_code_block_label = [code_label ^ ":"] in
+
+    (* 3. Generate code for the function body statements *)
     log " -> Generating function body";
-    codegen_stmt fdef.body;
-    log " -> Finished generating body";
+    let body_instrs = codegen_stmt ctx fdef.body in
 
-    (* If the last block is not terminated (e.g., a function ending in an if without else),
-       add a default return. This is mainly for functions that should return void.
-       For int functions, C semantics say behavior is undefined, but for a compiler
-       it's good practice to ensure all paths return. Here we assume valid C code. *)
-    (match Llvm.block_terminator (Llvm.insertion_block builder) with
-    | None ->
+    (* Add a terminator if the function doesn't end with one *)
+    let final_body =
+      if has_terminator body_instrs then body_instrs
+      else begin
         log " -> Block not terminated, adding unreachable.";
-        ignore(Llvm.build_unreachable builder)
-    | Some _ -> log " -> Block already terminated.");
+        body_instrs @ ["  unreachable"]
+      end
+    in
 
-    (* Verify function and return it *)
-    log (" -> Verifying function " ^ fdef.name);
-    Llvm_analysis.assert_valid_function the_function;
+    (* 4. Assemble the full function string *)
+    let all_lines =
+      [signature]
+      @ entry_block_label
+      @ initial_allocas
+      @ entry_branch
+      @ first_code_block_label
+      @ final_body
+      @ ["}"]
+    in
     log ("--- Finished function: " ^ fdef.name ^ " ---");
-    ignore the_function
+    String.concat "\n" all_lines
 
-  let codegen_program (prog: program) =
-    log "Starting codegen for program";
-    log "Pass 1: Declaring all functions";
-    (* Pass 1: Declare all functions so they can be called before being defined (recursion) *)
-    List.iter (fun (fdef: top_level_def) ->
-      log (" -> Declaring: " ^ fdef.name);
-      let ret_type = get_llvm_type fdef.ret_type in
-      let param_types = Array.of_list (List.map (fun (t,_) -> get_llvm_type t) fdef.params) in
-      let f_type = Llvm.function_type ret_type param_types in
-      ignore (Llvm.declare_function fdef.name f_type the_module)
-    ) prog;
-    log "Pass 1 complete.";
 
-    log "Pass 2: Defining all functions";
-    (* Pass 2: Define all functions *)
-    List.iter codegen_func_def prog;
-    log "Pass 2 complete.";
+  let codegen_program (prog: program) : (string, string) result =
+    try
+        log "Starting codegen for program";
+        let func_defs = List.map codegen_func_def prog in
+        let full_module = String.concat "\n\n" func_defs in
+        log "Codegen program finished.";
+        Ok full_module
+    with
+    | Failure msg -> Error ("Codegen failed: " ^ msg)
 
-    log "Codegen program finished.";
-
-    the_module
 end
 
 (* V. AST Pretty Printer (for debugging) *)
@@ -528,7 +575,8 @@ let () =
     }
 
     int main() {
-      return fac(4);
+      int result = fac(4);
+      return result;
     }
   " in
 
@@ -551,18 +599,21 @@ let () =
 
       (* --- Phase 2: Code Generation --- *)
       print_endline "PHASE 2: Generating LLVM IR...";
-      let llmodule = Codegen.codegen_program ast in
+      match Codegen.codegen_program ast with
+      | Error msg ->
+          print_endline ("Codegen failed: " ^ msg);
+          exit 1
+      | Ok ir_string ->
+          (* --- Phase 3: Output --- *)
+          print_endline "Successfully generated LLVM IR:";
+          print_endline ir_string;
 
-      (* --- Phase 3: Output --- *)
-      print_endline "Successfully generated LLVM IR:";
-      print_endline (Llvm.string_of_llmodule llmodule);
-
-      (* Optional: Verify the module for correctness *)
-      (match Llvm_analysis.verify_module llmodule with
-       | None -> print_endline "\nLLVM module is valid."
-       | Some err -> print_endline ("\nLLVM module verification failed:\n" ^ err));
-
-      (* Optional: Write to a file *)
-      let output_filename = "output.ll" in
-      Llvm.print_module output_filename llmodule;
-      Printf.printf "\nLLVM IR also written to %s\n" output_filename
+          (* Write to a file *)
+          let output_filename = "output.ll" in
+          (try
+            let oc = open_out output_filename in
+            Printf.fprintf oc "%s\n" ir_string;
+            close_out oc;
+            Printf.printf "\nLLVM IR also written to %s\n" output_filename
+          with Sys_error err ->
+            Printf.eprintf "Error writing to file %s: %s\n" output_filename err);
