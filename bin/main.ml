@@ -339,16 +339,17 @@ module Codegen = struct
         let (instrs1, res1) = codegen_expr ctx e1 in
         let (instrs2, res2) = codegen_expr ctx e2 in
         let op_str = string_of_binop op in
-        let res_name = new_temp ctx in
         let is_comparison = match op with Lt|Le|Gt|Ge|Eq|Ne -> true | _ -> false in
         if is_comparison then
           (* Comparisons produce an i1, which we must extend to i32 (0 or 1) for C semantics *)
           let i1_res = new_temp ctx in
           let cmp_instr = Printf.sprintf "  %s = %s i32 %s, %s" i1_res op_str res1 res2 in
+          let res_name = new_temp ctx in
           let zext_instr = Printf.sprintf "  %s = zext i1 %s to i32" res_name i1_res in
           (instrs1 @ instrs2 @ [cmp_instr; zext_instr], res_name)
         else
           (* Arithmetic operations produce an i32 directly *)
+          let res_name = new_temp ctx in
           let instr = Printf.sprintf "  %s = %s i32 %s, %s" res_name op_str res1 res2 in
           (instrs1 @ instrs2 @ [instr], res_name)
     | Call (name, args) ->
