@@ -397,9 +397,10 @@ module Ast_to_ssa = struct
           let (op, _) = convert_expr ctx e in
           seal_block ctx (T_Ret op)
       | While (cond, body) ->
-          let cond_bbid = start_new_block ctx in
-          seal_block ctx (T_Br cond_bbid); (* Jump to condition check *)
-
+          (* The block currently being built is the loop's pre-header. *)
+          (* We must end it and jump to the new condition-checking block. *)
+          let cond_bbid = new_bbid ctx in
+          seal_block ctx (T_Br cond_bbid);
           (* Condition block *)
           ctx.current_bbid <- cond_bbid;
           ctx.is_sealed <- false;
@@ -557,7 +558,7 @@ module Ssa_printer = struct
     | D_BinOp (op, o1, o2) -> Printf.sprintf "%s %s, %s" (string_of_binop op) (string_of_operand o1) (string_of_operand o2)
     | D_Call (name, args) -> Printf.sprintf "call @%s(%s)" name (String.concat ", " (List.map string_of_operand args))
     | D_Phi phis -> "phi " ^ (String.concat ", " (List.map (fun (op, bbid) -> Printf.sprintf "[ %s, %s ]" (string_of_operand op) (string_of_bbid bbid)) phis))
-    | D_Alloca _ -> "alloca"
+    | D_Alloca typ -> Printf.sprintf "alloca %s" typ
     | D_Load op -> Printf.sprintf "load %s" (string_of_operand op)
 
   let string_of_instruction instr =

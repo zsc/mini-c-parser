@@ -177,6 +177,26 @@ module Dce = struct
       ) bb.ops
     ) f.blocks;
 
+    (* Find alloca'd pointers that are actually used. A pointer is "used"
+       if it is loaded from or passed to a function (which might load from it).
+       A store does not count as a "use" for this purpose. This helps
+       identify stores to dead local variables. *)
+    let used_pointers = Hashtbl.create 16 in
+    let is_alloca_reg r =
+      match Hashtbl.find_opt reg_def_map r with
+      | Some { def = D_Alloca _; _ } -> true
+      | _ -> false
+    in
+    List.iter (fun bb ->
+        List.iter (function
+            | I_Instr { def = D_Load (O_Reg p); _ } when is_alloca_reg p ->
+                Hashtbl.replace used_pointers p ()
+            | I_Instr { def = D_Call (_, args); _ } ->
+                List.iter (fun arg -> match arg with O_Reg p when is_alloca_reg p -> Hashtbl.replace used_pointers p () | _ -> ()) args
+            | _ -> ()
+        ) bb.ops
+    ) f.blocks;
+
     (* A set to store the registers that are defined by live instructions.
        We use a Hashtbl for its efficient lookups. *)
     let live_regs = Hashtbl.create 64 in
@@ -196,9 +216,15 @@ module Dce = struct
 
       (* Side-effecting operations (stores, calls) are roots. *)
       List.iter (function
-        | I_Side_Effect sei ->
-            (* Registers used by side-effecting instructions (stores) are live. *)
-            List.iter add_to_worklist (get_used_regs_from_side_effect sei)
+        | I_Side_Effect (S_Store (addr, _) as sei) ->
+            (* A store is only a root of liveness if it's to a pointer
+               that is actually used, or it's not a known local alloca. *)
+            let is_live_store = match addr with
+              | O_Reg p when is_alloca_reg p -> Hashtbl.mem used_pointers p
+              | _ -> true (* Store to a param pointer, global, etc. -> consider live *)
+            in
+            if is_live_store then
+              List.iter add_to_worklist (get_used_regs_from_side_effect sei)
         | I_Instr instr ->
             (* All calls are considered live due to potential side effects.
          Therefore, the registers they use are live, and if they
@@ -248,7 +274,12 @@ module Dce = struct
                 (* Keep instruction if its result is live. Note that call
                    results were proactively marked live to preserve them. *)
                 Hashtbl.mem live_regs instr.reg
-            | I_Side_Effect _ -> true (* Always keep side effects like stores *)
+            | I_Side_Effect (S_Store (addr, _)) ->
+                (* A store is only kept if it's to a pointer that is
+                   actually used, or not a known local alloca. *)
+                (match addr with
+                 | O_Reg p when is_alloca_reg p -> Hashtbl.mem used_pointers p
+                 | _ -> true)
           ) bb.ops
         in
         { bb with ops = new_ops }
