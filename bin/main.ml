@@ -125,6 +125,9 @@ and parse_params tokens = match tokens with
       in loop [] tokens
 
 and parse_stmt tokens = match tokens with
+  | T_Semicolon :: rest ->
+      (* Handle empty statement, e.g., for(..); or just ;; *)
+      (Block [], rest)
   | T_Return :: rest ->
       let (expr, rest') = parse_expr rest in
       let rest'' = expect T_Semicolon rest' in
