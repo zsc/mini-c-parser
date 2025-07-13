@@ -23,7 +23,7 @@ open Ssa
 (* (Unaltered) *)
 
 type token =
-  | T_Int | T_Return | T_If | T_Else | T_While | T_For
+  | T_Int | T_Return | T_If | T_Else | T_While | T_For | T_Do
   | T_Id of string | T_Num of int
   | T_Plus | T_Minus | T_Star | T_Slash | T_Le | T_Eq | T_Ne | T_Lt | T_Gt | T_Ge
   | T_Lparen | T_Rparen | T_Assign | T_Lbrace | T_Rbrace | T_Lbracket | T_Rbracket | T_Ampersand
@@ -31,7 +31,7 @@ type token =
 
 let keyword_map = [
   ("int", T_Int); ("return", T_Return); ("if", T_If); ("else", T_Else);
-  ("while", T_While); ("for", T_For)
+  ("while", T_While); ("for", T_For); ("do", T_Do)
 ]
 
 let token_specs = [
@@ -72,7 +72,7 @@ exception Parser_error of string
 let fail_parse msg = raise (Parser_error msg)
 
 let string_of_token = function
-  | T_Int -> "T_Int" | T_Return -> "T_Return" | T_If -> "T_If" | T_Else -> "T_Else" | T_While -> "T_While" | T_For -> "T_For"
+  | T_Int -> "T_Int" | T_Return -> "T_Return" | T_If -> "T_If" | T_Else -> "T_Else" | T_While -> "T_While" | T_For -> "T_For" | T_Do -> "T_Do"
   | T_Id s -> Printf.sprintf "T_Id(%s)" s | T_Num n -> Printf.sprintf "T_Num(%d)" n
   | T_Plus -> "T_Plus" | T_Minus -> "T_Minus" | T_Star -> "T_Star" | T_Slash -> "T_Slash"
   | T_Le -> "T_Le" | T_Eq -> "T_Eq" | T_Ne -> "T_Ne" | T_Lt -> "T_Lt" | T_Gt -> "T_Gt" | T_Ge -> "T_Ge"
@@ -141,6 +141,14 @@ and parse_stmt tokens = match tokens with
         | T_Else :: rest' -> let (stmt, rest'') = parse_stmt rest' in (Some stmt, rest'')
         | _ -> (None, rest4) in
       (If (cond, then_stmt, else_stmt), rest_final)
+  | T_Do :: rest ->
+      let (body_stmt, rest1) = parse_stmt rest in
+      let rest2 = expect T_While rest1 in
+      let rest3 = expect T_Lparen rest2 in
+      let (cond_expr, rest4) = parse_expr rest3 in
+      let rest5 = expect T_Rparen rest4 in
+      let rest_final = expect T_Semicolon rest5 in
+      (DoWhile (body_stmt, cond_expr), rest_final)
   | T_While :: rest ->
       let rest1 = expect T_Lparen rest in
       let (cond, rest2) = parse_expr rest1 in
@@ -399,6 +407,25 @@ module Ast_to_ssa = struct
       | Return e ->
           let (op, _) = convert_expr ctx e in
           seal_block ctx (T_Ret op)
+      | DoWhile (body, cond) ->
+          (* The block currently being built is the loop's pre-header. *)
+          (* Unconditionally jump to the body block. *)
+          let body_bbid = new_bbid ctx in
+          seal_block ctx (T_Br body_bbid);
+
+          (* Loop body block *)
+          ctx.current_bbid <- body_bbid; ctx.is_sealed <- false;
+          convert_stmt ctx body;
+
+          (* After the body, if it hasn't terminated, check the condition. *)
+          if not ctx.is_sealed then (
+              let (cond_op, _) = convert_expr ctx cond in
+              let after_bbid = new_bbid ctx in
+              seal_block ctx (T_CBr (cond_op, body_bbid, after_bbid));
+              (* The new current block is the one after the loop. *)
+              ctx.current_bbid <- after_bbid;
+              ctx.is_sealed <- false
+          ) (* else, the body terminated, so flow doesn't continue. The context remains sealed. *)
       | While (cond, body) ->
           (* The block currently being built is the loop's pre-header. *)
           (* We must end it and jump to the new condition-checking block. *)
@@ -486,6 +513,7 @@ module Ast_to_ssa = struct
         let then_decls = find_decls_in_stmt then_s in
         let else_decls = match else_s_opt with Some s -> find_decls_in_stmt s | None -> [] in
         then_decls @ else_decls
+    | DoWhile (body, _) -> find_decls_in_stmt body
     | While (_, body) -> find_decls_in_stmt body
     | Block stmts -> List.concat_map find_decls_in_stmt stmts
     | _ -> []
@@ -731,6 +759,7 @@ let rec string_of_expr = function
 
 let rec string_of_stmt indent = function
   | Return e -> indent ^ "Return " ^ (string_of_expr e) ^ ";"
+  | DoWhile (b, c) -> indent ^ "Do\n" ^ (string_of_stmt (indent ^ "  ") b) ^ "\n" ^ indent ^ "While (" ^ (string_of_expr c) ^ ");"
   | While (c, b) -> indent ^ "While (" ^ (string_of_expr c) ^ ")\n" ^ (string_of_stmt (indent ^ "  ") b)
   | If (c, t, e_opt) ->
       let else_str = match e_opt with None -> "" | Some s -> "\n" ^ indent ^ "Else\n" ^ (string_of_stmt (indent ^ "  ") s) in
@@ -788,14 +817,10 @@ main()
 {
     int x;
 
-    x = 1;
-    for(x = 10; x; x = x - 1)
-        ;
-    if(x)
-        return 1;
-    x = 10;
-    for (;x;)
+    x = 50;
+    do
         x = x - 1;
+    while(x);
     return x;
 }
   " in

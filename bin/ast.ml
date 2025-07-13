@@ -22,6 +22,7 @@ type expr =
 (* 语句类型 *)
 type stmt =
   | Return of expr                  (* return 语句: e.g., return 1; *)
+  | DoWhile of stmt * expr          (* do-while 循环: do { body } while (cond); *)
   | While of expr * stmt            (* while 循环: while (cond) { body } *)
   | If of expr * stmt * stmt option (* if (cond) { then } else { else } *)
   | Block of stmt list              (* 代码块: { stmt1; stmt2; ... } *)
