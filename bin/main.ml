@@ -147,22 +147,33 @@ and parse_stmt tokens = match tokens with
   | T_For :: rest -> (* Desugar for loop into a while loop *)
       let rest1 = expect T_Lparen rest in
       (* Parse initializer: can be a declaration or expression stmt *)
-      let (init_stmt, rest2) = if List.hd rest1 = T_Semicolon then (Block [], rest1)
-                               else (let (s, r) = parse_stmt rest1 in (s,r)) in
-      let rest3 = expect T_Semicolon rest2 in
+      let (init_stmt, rest3) =
+        match rest1 with
+        | T_Semicolon :: r -> (Block [], r) (* Empty initializer, consume the semicolon *)
+        | _ -> parse_stmt rest1 (* Non-empty: parse_stmt consumes the required semicolon *)
+      in
       (* Parse condition *)
       let (cond_expr, rest4) = if List.hd rest3 = T_Semicolon then (Cst 1, rest3) (* Empty cond is true *)
                                else parse_expr rest3 in
       let rest5 = expect T_Semicolon rest4 in
       (* Parse post-loop expression *)
-      let (post_expr_opt, rest6) = if List.hd rest5 = T_Rparen then (None, rest5)
-                                   else (let (e,r) = parse_expr rest5 in (Some e, r)) in
+      let (post_stmt_opt, rest6) =
+        if List.hd rest5 = T_Rparen then (None, rest5)
+        else
+          (* The post-loop part can be an assignment (e.g. i=i+1) or an expression (e.g. f()).
+             Our AST separates these, so we can't just parse an 'expression'.
+             Instead, we replicate the logic from statement parsing but without expecting a semicolon. *)
+          let (lhs_expr, rest_after_lhs) = parse_expr rest5 in
+          match rest_after_lhs with
+          | T_Assign :: rest_assign ->
+              let (rhs_expr, rest_after_rhs) = parse_expr rest_assign in
+              (Some (Assign (lhs_expr, rhs_expr)), rest_after_rhs)
+          | _ ->
+              (Some (ExprStmt lhs_expr), rest_after_lhs)
+      in
       let rest7 = expect T_Rparen rest6 in
       let (body_stmt, rest_final) = parse_stmt rest7 in
       (* Desugar: { init; while(cond) { body; post; } } *)
-      let post_stmt_opt = match post_expr_opt with
-        | Some e -> Some (ExprStmt e)
-        | None -> None in
       let new_body = Block (match post_stmt_opt with Some s -> [body_stmt; s] | None -> [body_stmt]) in
       let while_loop = While (cond_expr, new_body) in
       (Block [init_stmt; while_loop], rest_final)
@@ -186,7 +197,7 @@ and parse_stmt tokens = match tokens with
            (Decl (decl_type, name, Some init_expr), r_final)
        | T_Semicolon :: r_final -> (Decl (decl_type, name, None), r_final) (* Corrected this line to align properly in git diff, no functional change *)
        | _ -> fail_parse "Malformed declaration")
-  | T_Id _ :: _ -> (* Match if the first token is an Id, then parse the expression from the original tokens list *)
+  | _ -> (* If it's not a keyword statement or declaration, it must be an expression-based one. *)
       let (lhs_expr, rest_expr) = parse_expr tokens in
       (match rest_expr with
         | T_Assign :: rest_assign ->
@@ -195,7 +206,6 @@ and parse_stmt tokens = match tokens with
             (Assign(lhs_expr, rhs_expr), rest_final)
         | T_Semicolon :: rest_final -> (ExprStmt lhs_expr, rest_final)
         | _ -> fail_parse "Expected '=' or ';' after expression statement")
-  | _ -> fail_parse "Unexpected token at start of statement"
 
 and parse_expr tokens = parse_assign_expr tokens
 and parse_assign_expr tokens = parse_equality_expr tokens
