@@ -1,4 +1,5 @@
 (executable
  (public_name mini-c-parser)
  (name main)
+ (modules ast main)
  (libraries str))
