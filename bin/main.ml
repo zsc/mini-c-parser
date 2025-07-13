@@ -56,6 +56,7 @@ type token =
   | T_Lparen | T_Rparen (* ( ) *)
   | T_Assign (* = *)
   | T_Lbrace | T_Rbrace (* { } *)
+  | T_Lbracket | T_Rbracket (* [ ] *)
   | T_Comma
   | T_Semicolon
   (* End of File *)
@@ -237,9 +238,9 @@ and parse_stmt tokens =
            (Decl (decl_type, name, None), rest_final)
        | _ -> failwith "Expected '=', '[', or ';' after identifier in declaration"
       )
-  | T_Id _ -> (* Assignment or function call as statement *)
+  | (T_Id _) :: _ as start_tokens -> (* Assignment or function call as statement *)
       (* Try to parse the expression which could be an L-value or a Call *)
-      let (first_expr, rest_after_expr) = parse_expr tokens in
+      let (first_expr, rest_after_expr) = parse_expr start_tokens in
       (match rest_after_expr with
        | T_Assign :: rest_assign ->
            let (rhs_expr, rest_rhs) = parse_expr rest_assign in
@@ -256,7 +257,7 @@ and parse_stmt tokens =
 (* 表达式解析 (带操作符优先级) *)
 and parse_expr tokens = parse_equality_expr tokens
 
-and parse_equality_expr tokens =
+and parse_equality_expr tokens = (* ==, != *)
   let rec loop lhs toks =
     match toks with
     | T_Eq :: rest ->
@@ -269,8 +270,8 @@ and parse_equality_expr tokens =
   in
   let (lhs, rest) = parse_relational_expr tokens in
   loop lhs rest
-
-and parse_relational_expr tokens =
+ 
+and parse_relational_expr tokens = (* <, <=, >, >= *)
   let rec loop lhs toks =
     match toks with
     | T_Lt :: rest ->
@@ -289,8 +290,8 @@ and parse_relational_expr tokens =
   in
   let (lhs, rest) = parse_additive_expr tokens in
   loop lhs rest
-
-and parse_additive_expr tokens =
+ 
+and parse_additive_expr tokens = (* +, - *)
   let rec loop lhs toks =
     match toks with
     | T_Plus :: rest ->
@@ -303,20 +304,32 @@ and parse_additive_expr tokens =
   in
   let (lhs, rest) = parse_multiplicative_expr tokens in
   loop lhs rest
-
-and parse_multiplicative_expr tokens =
+ 
+and parse_multiplicative_expr tokens = (* *, / *)
   let rec loop lhs toks =
     match toks with
     | T_Star :: rest ->
-        let (rhs, rest') = parse_primary_expr rest in
+        let (rhs, rest') = parse_unary_expr rest in (* Changed to parse_unary_expr *)
         loop (BinOp (Mul, lhs, rhs)) rest'
     | T_Slash :: rest ->
-        let (rhs, rest') = parse_primary_expr rest in
+        let (rhs, rest') = parse_unary_expr rest in (* Changed to parse_unary_expr *)
         loop (BinOp (Div, lhs, rhs)) rest'
     | _ -> (lhs, toks)
   in
-  let (lhs, rest) = parse_primary_expr tokens in
+  let (lhs, rest) = parse_unary_expr tokens in (* Changed to parse_unary_expr *)
   loop lhs rest
+ 
+(* New: Unary expressions (e.g., -x, +x) *)
+and parse_unary_expr tokens =
+  match tokens with
+  | T_Minus :: rest ->
+      let (expr, rest') = parse_unary_expr rest in (* Allows chaining like --x *)
+      (BinOp (Sub, Cst 0, expr), rest') (* Represent -expr as (0 - expr) *)
+  | T_Plus :: rest -> (* Unary plus, typically a no-op, just consume *)
+      parse_unary_expr rest
+  | _ ->
+      parse_primary_expr tokens
+ 
 
 and parse_primary_expr tokens =
   match tokens with
@@ -328,7 +341,7 @@ and parse_primary_expr tokens =
   | T_Lparen :: rest ->
       let (expr, rest') = parse_expr rest in
       let rest'' = expect T_Rparen rest' in
-      (expr, rest'')
+      parse_postfix_expr expr rest'' (* The expression inside parentheses can also be a base for postfix operations *)
   | _ -> failwith "Parser error: Unexpected token in expression"
 
 (* This function takes a 'base' expression (e.g., an Id) and applies
