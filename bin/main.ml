@@ -289,6 +289,14 @@ module Ast_to_ssa = struct
   open Ast
   open Ssa
 
+  let get_pointee_type (ptr_type: string) : string =
+    let len = String.length ptr_type in
+    if len > 0 && ptr_type.[len - 1] = '*' then
+      String.sub ptr_type 0 (len - 1)
+    else
+      failwith ("Cannot get pointee type of non-pointer type: " ^ ptr_type)
+
+
   type ssa_builder_context = {
     mutable reg_counter: int;
     mutable bbid_counter: int;
@@ -297,6 +305,8 @@ module Ast_to_ssa = struct
     mutable func_blocks: basic_block list;
     mutable current_bbid: bbid;
     mutable is_sealed: bool; (* true if the current block is terminated *)
+    var_types: (string, string) Hashtbl.t; (* var name -> type string *)
+    reg_types: (reg, string) Hashtbl.t; (* reg -> type string *)
   }
 
   let new_reg ctx = let i = ctx.reg_counter in ctx.reg_counter <- i + 1; R i
@@ -310,6 +320,8 @@ module Ast_to_ssa = struct
     func_blocks = [];
     current_bbid = L (-1); (* Invalid initial bbid *)
     is_sealed = true; (* A new context has no open block to add to *)
+    var_types = Hashtbl.create 16;
+    reg_types = Hashtbl.create 64;
   }
 
   (* Finalizes the current basic block and adds it to the function's list *)
@@ -331,32 +343,35 @@ module Ast_to_ssa = struct
     ctx.is_sealed <- false;
     bbid
 
-  let add_instr ctx def =
+  let add_instr ctx def typ =
     let reg = new_reg ctx in
     let instr = { reg; def } in
     ctx.current_block_ops <- I_Instr instr :: ctx.current_block_ops;
+    Hashtbl.add ctx.reg_types reg typ;
     reg
 
   let add_side_effect ctx sei =
     ctx.current_block_ops <- I_Side_Effect sei :: ctx.current_block_ops
 
-  let rec convert_expr ctx (expr: Ast.expr) : operand =
+  let rec convert_expr ctx (expr: Ast.expr) : operand * string =
     match expr with
-    | Cst i -> O_Cst i
+    | Cst i -> (O_Cst i, "int")
     | Id s ->
         let ptr_reg = Hashtbl.find ctx.var_map s in
-        let res_reg = add_instr ctx (D_Load (O_Reg ptr_reg)) in
-        O_Reg res_reg
+        let var_type = Hashtbl.find ctx.var_types s in
+        let res_reg = add_instr ctx (D_Load (O_Reg ptr_reg)) var_type in
+        (O_Reg res_reg, var_type)
     | BinOp (op, e1, e2) ->
-        let op1 = convert_expr ctx e1 in
-        let op2 = convert_expr ctx e2 in
-        let res_reg = add_instr ctx (D_BinOp (op, op1, op2)) in
-        O_Reg res_reg
+        let (op1, _) = convert_expr ctx e1 in
+        let (op2, _) = convert_expr ctx e2 in
+        let res_reg = add_instr ctx (D_BinOp (op, op1, op2)) "int" in
+        (O_Reg res_reg, "int")
     | AddrOf e ->
         (match e with
          | Id s -> (* &var *)
              let ptr_reg = Hashtbl.find ctx.var_map s in
-             O_Reg ptr_reg
+             let var_type = Hashtbl.find ctx.var_types s in
+             (O_Reg ptr_reg, var_type ^ "*")
          | Deref ptr_expr -> (* &( *p ) simplifies to p *)
              convert_expr ctx ptr_expr
          | ArrayAccess (_, _) ->
@@ -364,20 +379,22 @@ module Ast_to_ssa = struct
          | _ ->
              failwith "AST to SSA: Cannot take address of a non-lvalue expression")
     | Deref e -> (* *ptr_expr *)
-        let ptr_op = convert_expr ctx e in
-        let res_reg = add_instr ctx (D_Load ptr_op) in
-        O_Reg res_reg
+        let (ptr_op, ptr_type) = convert_expr ctx e in
+        let pointee_type = get_pointee_type ptr_type in
+        let res_reg = add_instr ctx (D_Load ptr_op) pointee_type in
+        (O_Reg res_reg, pointee_type)
     | Call (name, args) ->
-        let arg_ops = List.map (convert_expr ctx) args in
-        let res_reg = add_instr ctx (D_Call (name, arg_ops)) in
-        O_Reg res_reg
+        let arg_ops = List.map (fun e -> fst (convert_expr ctx e)) args in
+        (* Assuming all functions return int for now *)
+        let res_reg = add_instr ctx (D_Call (name, arg_ops)) "int" in
+        (O_Reg res_reg, "int")
     | ArrayAccess (_, _) -> failwith "AST to SSA: Array access not implemented"
 
   let rec convert_stmt ctx (stmt: Ast.stmt) : unit =
     if ctx.is_sealed then () (* Unreachable code, do nothing *)
     else match stmt with
       | Return e ->
-          let op = convert_expr ctx e in
+          let (op, _) = convert_expr ctx e in
           seal_block ctx (T_Ret op)
       | While (cond, body) ->
           let cond_bbid = start_new_block ctx in
@@ -386,7 +403,7 @@ module Ast_to_ssa = struct
           (* Condition block *)
           ctx.current_bbid <- cond_bbid;
           ctx.is_sealed <- false;
-          let cond_op = convert_expr ctx cond in
+          let (cond_op, _) = convert_expr ctx cond in
           let body_bbid = new_bbid ctx in
           let after_bbid = new_bbid ctx in
           seal_block ctx (T_CBr (cond_op, body_bbid, after_bbid));
@@ -399,7 +416,7 @@ module Ast_to_ssa = struct
           (* After loop block *)
           ctx.current_bbid <- after_bbid; ctx.is_sealed <- false
       | If (cond, then_s, else_s_opt) ->
-          let cond_op = convert_expr ctx cond in
+          let (cond_op, _) = convert_expr ctx cond in
           let then_bbid = new_bbid ctx in
           let else_bbid = new_bbid ctx in
           let merge_bbid = new_bbid ctx in
@@ -440,27 +457,27 @@ module Ast_to_ssa = struct
         let ptr_reg = Hashtbl.find ctx.var_map name in (* Must have been pre-allocated *)
         (match init_opt with
          | Some e ->
-             let val_op = convert_expr ctx e in
+             let (val_op, _) = convert_expr ctx e in
              add_side_effect ctx (S_Store (O_Reg ptr_reg, val_op))
          | None -> ())
     | Assign (lhs, rhs) ->
-        let rhs_op = convert_expr ctx rhs in
+        let (rhs_op, _) = convert_expr ctx rhs in
         (match lhs with
          | Id s ->
              let ptr_reg = Hashtbl.find ctx.var_map s in
              add_side_effect ctx (S_Store (O_Reg ptr_reg, rhs_op))
          | Deref ptr_expr ->
-             let addr_op = convert_expr ctx ptr_expr in
+             let (addr_op, _) = convert_expr ctx ptr_expr in
              add_side_effect ctx (S_Store (addr_op, rhs_op))
          | _ -> failwith "AST to SSA: Assignment to non-variable not implemented")
     | ExprStmt e ->
         let _ = convert_expr ctx e in ()
     | ArrayDecl _ -> failwith "AST to SSA: Array declaration not implemented"
 
-  let rec find_decls_in_stmt (stmt: Ast.stmt) : string list =
+  let rec find_decls_in_stmt (stmt: Ast.stmt) : (string * string) list =
     match stmt with
-    | Decl (_, name, _) -> [name]
-    | ArrayDecl (_, name, _) -> [name]
+    | Decl (typ, name, _) -> [(name, typ)]
+    | ArrayDecl (typ, name, _) -> [(name, typ ^ "*")] (* Array decays to pointer *)
     | If (_, then_s, else_s_opt) ->
         let then_decls = find_decls_in_stmt then_s in
         let else_decls = match else_s_opt with Some s -> find_decls_in_stmt s | None -> [] in
@@ -475,22 +492,29 @@ module Ast_to_ssa = struct
     (* Start the entry block *)
     let _ = start_new_block ctx in
 
+    (* Gather all types of parameters and local variables *)
+    List.iter (fun (typ, name) -> Hashtbl.add ctx.var_types name typ) fdef.params;
+    let local_decls = find_decls_in_stmt fdef.body in
+    List.iter (fun (name, typ) -> Hashtbl.add ctx.var_types name typ) local_decls;
+
+
     (* Process parameters *)
-    let param_regs = List.map (fun (_, name) ->
+    let param_regs = List.map (fun (param_type, name) ->
         let param_val_reg = new_reg ctx in (* This will hold the incoming value *)
-        let ptr_reg = add_instr ctx D_Alloca in
+        Hashtbl.add ctx.reg_types param_val_reg param_type;
+        let ptr_reg = add_instr ctx (D_Alloca param_type) (param_type ^ "*") in
         add_side_effect ctx (S_Store (O_Reg ptr_reg, O_Reg param_val_reg));
         Hashtbl.add ctx.var_map name ptr_reg;
         param_val_reg
       ) fdef.params
     in
 
-    (* Allocate space for all local variables *)
-    let local_vars = find_decls_in_stmt fdef.body in
-    List.iter (fun name ->
-        let ptr_reg = add_instr ctx D_Alloca in
-        Hashtbl.add ctx.var_map name ptr_reg;
-      ) local_vars;
+     (* Allocate space for all local variables *)
+    List.iter (fun (name, typ) ->
+      if not (Hashtbl.mem ctx.var_map name) then
+        let ptr_reg = add_instr ctx (D_Alloca typ) (typ ^ "*") in
+        Hashtbl.add ctx.var_map name ptr_reg
+    ) local_decls;
 
     (* Convert the function body *)
     convert_stmt ctx fdef.body;
@@ -506,6 +530,7 @@ module Ast_to_ssa = struct
       name = fdef.name;
       params = param_regs;
       blocks = List.rev ctx.func_blocks;
+      reg_types = ctx.reg_types;
     }
 
   let convert_program (prog: Ast.program) : Ssa.program =
@@ -532,7 +557,7 @@ module Ssa_printer = struct
     | D_BinOp (op, o1, o2) -> Printf.sprintf "%s %s, %s" (string_of_binop op) (string_of_operand o1) (string_of_operand o2)
     | D_Call (name, args) -> Printf.sprintf "call @%s(%s)" name (String.concat ", " (List.map string_of_operand args))
     | D_Phi phis -> "phi " ^ (String.concat ", " (List.map (fun (op, bbid) -> Printf.sprintf "[ %s, %s ]" (string_of_operand op) (string_of_bbid bbid)) phis))
-    | D_Alloca -> "alloca"
+    | D_Alloca _ -> "alloca"
     | D_Load op -> Printf.sprintf "load %s" (string_of_operand op)
 
   let string_of_instruction instr =
@@ -569,9 +594,18 @@ end
 (* VI. Code Generation (from SSA to LLVM IR) *)
 module Codegen = struct
   open Ssa
+  open Ast_to_ssa
 
   let string_of_ssa_reg (R i) = "%r" ^ string_of_int i
   let string_of_ssa_bbid (L i) = "L" ^ string_of_int i
+
+  let rec ll_type_of_ssa_type (typ: string) : string =
+    if typ = "int" then "i32"
+    else
+      let len = String.length typ in
+      if len > 0 && typ.[len - 1] = '*' then
+        (ll_type_of_ssa_type (get_pointee_type typ)) ^ "*"
+      else failwith ("Unknown SSA type for codegen: " ^ typ)
 
   let string_of_ssa_operand (op: operand) : string =
     match op with
@@ -591,7 +625,7 @@ module Codegen = struct
     | Eq  -> "icmp eq"
     | Ne  -> "icmp ne"
 
-  let codegen_instr (instr: instruction) : string list =
+  let codegen_instr (reg_types: (reg, string) Hashtbl.t) (instr: instruction) : string list =
     let dest_reg = string_of_ssa_reg instr.reg in
     match instr.def with
     | D_BinOp (op, o1, o2) ->
@@ -610,18 +644,27 @@ module Codegen = struct
         let arg_strs = List.map (fun op -> "i32 " ^ string_of_ssa_operand op) args in
         [Printf.sprintf "  %s = call i32 @%s(%s)" dest_reg name (String.concat ", " arg_strs)]
     | D_Phi _ -> failwith "LLVM Codegen: Phi nodes not supported in this simplified compiler"
-    | D_Alloca ->
-        [Printf.sprintf "  %s = alloca i32, align 4" dest_reg]
+    | D_Alloca typ ->
+        let ll_type = ll_type_of_ssa_type typ in
+        [Printf.sprintf "  %s = alloca %s, align 4" dest_reg ll_type]
     | D_Load addr_op ->
+        let res_type_str = Hashtbl.find reg_types instr.reg in
+        let ll_res_type = ll_type_of_ssa_type res_type_str in
+        let ll_ptr_type = ll_res_type ^ "*" in
         let s_addr = string_of_ssa_operand addr_op in
-        [Printf.sprintf "  %s = load i32, i32* %s, align 4" dest_reg s_addr]
+        [Printf.sprintf "  %s = load %s, %s %s, align 4" dest_reg ll_res_type ll_ptr_type s_addr]
 
-  let codegen_side_effect (sei: side_effect_instr) : string =
+  let codegen_side_effect (reg_types: (reg, string) Hashtbl.t) (sei: side_effect_instr) : string =
     match sei with
     | S_Store (addr_op, val_op) ->
         let s_addr = string_of_ssa_operand addr_op in
         let s_val = string_of_ssa_operand val_op in
-        Printf.sprintf "  store i32 %s, i32* %s, align 4" s_val s_addr
+        let val_type_str = match val_op with
+          | O_Reg r -> Hashtbl.find reg_types r
+          | O_Cst _ -> "int"
+          | O_Global _ -> failwith "Cannot store a global function name" in
+        let ll_val_type = ll_type_of_ssa_type val_type_str in
+        Printf.sprintf "  store %s %s, %s* %s, align 4" ll_val_type s_val ll_val_type s_addr
 
   let codegen_terminator (term: terminator) : string list =
     match term with
@@ -634,19 +677,19 @@ module Codegen = struct
         let br_instr = Printf.sprintf "  br i1 %s, label %%%s, label %%%s" i1_res_for_br (string_of_ssa_bbid ltrue) (string_of_ssa_bbid lfalse) in
         [cmp_instr; br_instr]
 
-  let codegen_bb (bb: basic_block) : string list =
+  let codegen_bb (reg_types: (reg, string) Hashtbl.t) (bb: basic_block) : string list =
     let label = (string_of_ssa_bbid bb.id) ^ ":" in
     let ops_code = List.concat_map (function
-      | I_Instr i -> codegen_instr i
-      | I_Side_Effect s -> [codegen_side_effect s]
+      | I_Instr i -> codegen_instr reg_types i
+      | I_Side_Effect s -> [codegen_side_effect reg_types s]
       ) bb.ops in
     let term = codegen_terminator bb.term in
     [label] @ ops_code @ term
 
   let codegen_func (f: func_def) : string =
-    let param_strs = List.map (fun r -> "i32 " ^ string_of_ssa_reg r) f.params in
+    let param_strs = List.map (fun r -> (ll_type_of_ssa_type (Hashtbl.find f.reg_types r)) ^ " " ^ string_of_ssa_reg r) f.params in
     let signature = Printf.sprintf "define i32 @%s(%s) {" f.name (String.concat ", " param_strs) in
-    let body_lines = List.concat_map codegen_bb f.blocks in
+    let body_lines = List.concat_map (codegen_bb f.reg_types) f.blocks in
     String.concat "\n" ([signature] @ body_lines @ ["}"])
 
   let codegen_program (prog: Ssa.program) : (string, string) result =

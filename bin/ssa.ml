@@ -51,7 +51,7 @@ module Ssa = struct
        e.g., phi [op1, from_block1], [op2, from_block2] *)
     | D_Phi of (operand * bbid) list
     (* Memory allocation on the stack, produces a pointer. *)
-    | D_Alloca
+    | D_Alloca of string (* The type being allocated, e.g., "int", "int*" *)
     (* Load a value from a memory address (which is an operand). *)
     | D_Load of operand
     (* A 'Store' is not a definition because it doesn't produce a value.
@@ -100,6 +100,7 @@ module Ssa = struct
     name: string;
     params: reg list; (* Parameters are passed in registers. *)
     blocks: basic_block list;
+    reg_types: (reg, string) Hashtbl.t;
   }
 
   (* A program is a list of function definitions. *)
@@ -134,7 +135,7 @@ module Dce = struct
     | D_Phi phis ->
         let ops = List.map (fun (op, _) -> op) phis in
         used_regs_from_operands ops
-    | D_Alloca -> []
+    | D_Alloca _ -> []
     | D_Load addr_op -> used_regs_from_operand addr_op
 
   (* Traverses a side-effecting instruction to find its used registers. *)
@@ -254,6 +255,6 @@ module Dce = struct
       ) f.blocks
     in
 
-    { f with blocks = new_blocks }
+    { f with blocks = new_blocks; reg_types = f.reg_types }
 
 end
