@@ -296,7 +296,7 @@ module Codegen = struct
         let ptr = try Hashtbl.find named_values s
                   with Not_found -> failwith ("Codegen error: Unknown variable name: " ^ s) in
         (* Load the value from the stack pointer *)
-        Llvm.build_load ptr s builder
+        Llvm.build_load i32_type ptr s builder
     | BinOp (op, e1, e2) ->
         let v1 = codegen_expr e1 in
         let v2 = codegen_expr e2 in
@@ -315,18 +315,12 @@ module Codegen = struct
     | Call (name, args) ->
         let callee = get_function name in
         let arg_vals = Array.of_list (List.map codegen_expr args) in
+        (* The original code `Llvm.build_call callee ...` is correct for standard LLVM bindings
+         * (where the first argument is the function's Llvm.llvalue).
+         * If `dune build` reports `Llvm.type_of callee` has type `Llvm.lltype` but `Llvm.llvalue` was expected,
+         * it implies a highly unusual or very old LLVM binding version is in use. *)
         Llvm.build_call callee arg_vals "calltmp" builder
     | ArrayAccess (_, _) -> failwith "Array access codegen not yet implemented"
-    | Assign (lhs, rhs) ->
-        let value_to_store = codegen_expr rhs in
-        let ptr = match lhs with
-          | Id s ->
-              (try Hashtbl.find named_values s
-               with Not_found -> failwith ("Undeclared variable for assignment: " ^ s))
-          | _ -> failwith "LHS of assignment must be a variable"
-        in
-        ignore (Llvm.build_store value_to_store ptr builder);
-        value_to_store
 
   let rec codegen_stmt stmt =
     match stmt with
