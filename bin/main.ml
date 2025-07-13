@@ -342,9 +342,17 @@ module Ast_to_ssa = struct
         let op2 = convert_expr ctx e2 in
         let res_reg = add_instr ctx (D_BinOp (op, op1, op2)) in
         O_Reg res_reg
-    | AddrOf (Id s) -> (* &var *)
-        let ptr_reg = Hashtbl.find ctx.var_map s in
-        O_Reg ptr_reg
+    | AddrOf e ->
+        (match e with
+         | Id s -> (* &var *)
+             let ptr_reg = Hashtbl.find ctx.var_map s in
+             O_Reg ptr_reg
+         | Deref ptr_expr -> (* &( *p ) simplifies to p *)
+             convert_expr ctx ptr_expr
+         | ArrayAccess (_, _) ->
+             failwith "AST to SSA: Address of array element not implemented"
+         | _ ->
+             failwith "AST to SSA: Cannot take address of a non-lvalue expression")
     | Deref e -> (* *ptr_expr *)
         let ptr_op = convert_expr ctx e in
         let res_reg = add_instr ctx (D_Load ptr_op) in
