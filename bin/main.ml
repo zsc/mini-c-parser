@@ -324,11 +324,12 @@ module Codegen = struct
     | Call (name, args) ->
         let callee = get_function name in
         let arg_vals = Array.of_list (List.map codegen_expr args) in
-        (* The original code `Llvm.build_call callee ...` is correct for standard LLVM bindings
-         * (where the first argument is the function's Llvm.llvalue).
-         * If `dune build` reports `callee` has type `Llvm.llvalue` but `Llvm.lltype` was expected,
-         * it implies a highly unusual or very old LLVM binding version is in use. *)
-        Llvm.build_call (Llvm.type_of callee) callee arg_vals "calltmp" builder
+        (* Get the type of the callee value, which is a pointer-to-function-type *)
+        let callee_type = Llvm.type_of callee in
+        (* Get the function type itself by finding the element type of the pointer *)
+        let f_type = Llvm.element_type callee_type in
+        (* Now call with the correct types *)
+        Llvm.build_call f_type callee arg_vals "calltmp" builder
     | ArrayAccess (_, _) -> failwith "Array access codegen not yet implemented"
 
   let rec codegen_stmt stmt =
@@ -401,16 +402,31 @@ module Codegen = struct
     let bb = Llvm.append_block the_context "entry" the_function in
     Llvm.position_at_end bb builder;
 
+    (* Create a builder that always inserts at the top of the entry block.
+       All allocas must be placed here. *)
+    let entry_builder = Llvm.builder_at_end the_context (Llvm.entry_block the_function) in
+
     (* Allocate space for all parameters and store their initial values *)
     Array.iteri (fun i param_ll ->
       let (param_type, param_name) = List.nth fdef.params i in
       Llvm.set_value_name param_name param_ll;
-      let alloca = Llvm.build_alloca (get_llvm_type param_type) param_name builder in
+      (* Create the alloca in the entry block using the entry_builder *)
+      let alloca = Llvm.build_alloca (get_llvm_type param_type) param_name entry_builder in
+      (* The store instruction happens at the current position of the main builder *)
       ignore (Llvm.build_store param_ll alloca builder);
       Hashtbl.add named_values param_name alloca
     ) (Llvm.params the_function);
 
     codegen_stmt fdef.body;
+
+    (* If the last block is not terminated (e.g., a function ending in an if without else),
+       add a default return. This is mainly for functions that should return void.
+       For int functions, C semantics say behavior is undefined, but for a compiler
+       it's good practice to ensure all paths return. Here we assume valid C code. *)
+    (match Llvm.block_terminator (Llvm.insertion_block builder) with
+    | None -> ignore(Llvm.build_unreachable builder)
+    | Some _ -> ());
+
 
     (* Verify function and return it *)
     Llvm_analysis.assert_valid_function the_function;
