@@ -276,6 +276,9 @@ let parse_from_string str =
 (* IV. Code Generation (to LLVM IR) *)
 
 module Codegen = struct
+  (* Helper for logging *)
+  let log msg = print_endline ("[Codegen] " ^ msg)
+
   let the_context = Llvm.global_context ()
   let the_module = Llvm.create_module the_context "mini-c-compiler"
   let builder = Llvm.builder the_context
@@ -294,21 +297,26 @@ module Codegen = struct
 
   (* Look up a function in the module, error if not found. *)
   let get_function name =
+    log ("Looking up function: " ^ name);
     match Llvm.lookup_function name the_module with
-    | Some f -> f
+    | Some f -> log ("Found function: " ^ name); f
     | None -> failwith ("Codegen error: Unknown function referenced: " ^ name)
 
   let rec codegen_expr expr =
     match expr with
     | Cst i -> Llvm.const_int i32_type i
     | Id s ->
+        log ("Generating expr: Id(" ^ s ^ ")");
         let ptr = try Hashtbl.find named_values s
                   with Not_found -> failwith ("Codegen error: Unknown variable name: " ^ s) in
         (* Load the value from the stack pointer *)
+        log (" -> Found var '" ^ s ^ "', loading from pointer.");
         Llvm.build_load i32_type ptr s builder
     | BinOp (op, e1, e2) ->
+        log "Generating expr: BinOp";
         let v1 = codegen_expr e1 in
         let v2 = codegen_expr e2 in
+        log " -> Operands generated, building instruction.";
         (match op with
         | Add -> Llvm.build_add v1 v2 "addtmp" builder
         | Sub -> Llvm.build_sub v1 v2 "subtmp" builder
@@ -322,22 +330,29 @@ module Codegen = struct
         | Ne -> Llvm.build_icmp Llvm.Icmp.Ne v1 v2 "cmptmp" builder
         )
     | Call (name, args) ->
+        log ("Generating expr: Call to '" ^ name ^ "'");
         let callee = get_function name in
         let arg_vals = Array.of_list (List.map codegen_expr args) in
-        (* Get the type of the callee value, which is a pointer-to-function-type *)
-        let callee_type = Llvm.type_of callee in
-        (* Get the function type itself by finding the element type of the pointer *)
-        let f_type = Llvm.element_type callee_type in
-        (* Now call with the correct types *)
-        Llvm.build_call f_type callee arg_vals "calltmp" builder
+        (* The function value 'callee' already has its type associated with it.
+           We can call it directly. The 'build_call2' function is needed if
+           the type and value are separate (e.g., for function pointer casting). *)
+        log (" -> Arguments generated. Building call instruction for '" ^ name ^ "'");
+        Llvm.build_call callee arg_vals "calltmp" builder
     | ArrayAccess (_, _) -> failwith "Array access codegen not yet implemented"
 
   let rec codegen_stmt stmt =
     match stmt with
-    | Block stmts -> List.iter codegen_stmt stmts
-    | ExprStmt e -> ignore (codegen_expr e)
-    | Return e -> ignore (Llvm.build_ret (codegen_expr e) builder)
+    | Block stmts ->
+        log "Generating stmt: Block";
+        List.iter codegen_stmt stmts
+    | ExprStmt e ->
+        log "Generating stmt: ExprStmt";
+        ignore (codegen_expr e)
+    | Return e ->
+        log "Generating stmt: Return";
+        ignore (Llvm.build_ret (codegen_expr e) builder)
     | If (cond, then_s, else_s_opt) ->
+        log "Generating stmt: If";
         let cond_val = codegen_expr cond in
         (* C booleans are 0 (false) or non-zero (true). LLVM needs i1. *)
         let zero = Llvm.const_int i32_type 0 in
@@ -352,15 +367,18 @@ module Codegen = struct
         let merge_bb = Llvm.append_block the_context "ifcont" the_function in
 
         (* Create the conditional branch. *)
+        log " -> Building conditional branch";
         ignore (Llvm.build_cond_br bool_val then_bb else_bb builder);
 
         (* Emit 'then' block. *)
+        log " -> Generating 'then' block";
         Llvm.position_at_end then_bb builder;
         codegen_stmt then_s;
         if Llvm.block_terminator (Llvm.insertion_block builder) = None then
             ignore (Llvm.build_br merge_bb builder);
 
         (* Emit 'else' block. *)
+        log " -> Generating 'else' block";
         Llvm.position_at_end else_bb builder;
         (match else_s_opt with
         | Some s -> codegen_stmt s
@@ -369,23 +387,28 @@ module Codegen = struct
             ignore (Llvm.build_br merge_bb builder);
 
         (* Reposition builder to the merge block. *)
+        log " -> Moving to 'merge' block";
         Llvm.position_at_end merge_bb builder
 
     | Decl (_, name, init_opt) ->
+        log ("Generating stmt: Decl for var '" ^ name ^ "'");
         (* Create an alloca for the local variable in the function's entry block. *)
         let func = Llvm.block_parent (Llvm.insertion_block builder) in
         let entry_builder = Llvm.builder_at_end the_context (Llvm.entry_block func) in
         let alloca = Llvm.build_alloca i32_type name entry_builder in
         Hashtbl.add named_values name alloca;
+        log (" -> Allocated '" ^ name ^ "' on stack");
 
         (* If there's an initializer, store its value. *)
         (match init_opt with
         | Some e ->
+            log (" -> Generating initializer for '" ^ name ^ "'");
             let init_val = codegen_expr e in
             ignore (Llvm.build_store init_val alloca builder)
         | None -> ())
     | ArrayDecl _ -> failwith "Array declaration codegen not yet implemented"
     | Assign (lhs, rhs) ->
+        log "Generating stmt: Assign";
         let value_to_store = codegen_expr rhs in
         let ptr = match lhs with
           | Id s ->
@@ -393,9 +416,11 @@ module Codegen = struct
                with Not_found -> failwith ("Undeclared variable for assignment: " ^ s))
           | _ -> failwith "LHS of assignment must be a variable"
         in
+        log " -> Storing value to pointer";
         ignore (Llvm.build_store value_to_store ptr builder)
 
   let codegen_func_def (fdef: top_level_def) =
+    log ("--- Defining function: " ^ fdef.name ^ " ---");
     Hashtbl.clear named_values; (* Clear symbol table for new function *)
 
     let the_function = get_function fdef.name in
@@ -406,9 +431,11 @@ module Codegen = struct
        All allocas must be placed here. *)
     let entry_builder = Llvm.builder_at_end the_context (Llvm.entry_block the_function) in
 
+    log " -> Allocating and storing parameters";
     (* Allocate space for all parameters and store their initial values *)
     Array.iteri (fun i param_ll ->
       let (param_type, param_name) = List.nth fdef.params i in
+      log ("    - Param: " ^ param_name);
       Llvm.set_value_name param_name param_ll;
       (* Create the alloca in the entry block using the entry_builder *)
       let alloca = Llvm.build_alloca (get_llvm_type param_type) param_name entry_builder in
@@ -417,32 +444,45 @@ module Codegen = struct
       Hashtbl.add named_values param_name alloca
     ) (Llvm.params the_function);
 
+    log " -> Generating function body";
     codegen_stmt fdef.body;
+    log " -> Finished generating body";
 
     (* If the last block is not terminated (e.g., a function ending in an if without else),
        add a default return. This is mainly for functions that should return void.
        For int functions, C semantics say behavior is undefined, but for a compiler
        it's good practice to ensure all paths return. Here we assume valid C code. *)
     (match Llvm.block_terminator (Llvm.insertion_block builder) with
-    | None -> ignore(Llvm.build_unreachable builder)
-    | Some _ -> ());
-
+    | None ->
+        log " -> Block not terminated, adding unreachable.";
+        ignore(Llvm.build_unreachable builder)
+    | Some _ -> log " -> Block already terminated.");
 
     (* Verify function and return it *)
+    log (" -> Verifying function " ^ fdef.name);
     Llvm_analysis.assert_valid_function the_function;
+    log ("--- Finished function: " ^ fdef.name ^ " ---");
     ignore the_function
 
   let codegen_program (prog: program) =
+    log "Starting codegen for program";
+    log "Pass 1: Declaring all functions";
     (* Pass 1: Declare all functions so they can be called before being defined (recursion) *)
     List.iter (fun (fdef: top_level_def) ->
+      log (" -> Declaring: " ^ fdef.name);
       let ret_type = get_llvm_type fdef.ret_type in
       let param_types = Array.of_list (List.map (fun (t,_) -> get_llvm_type t) fdef.params) in
       let f_type = Llvm.function_type ret_type param_types in
       ignore (Llvm.declare_function fdef.name f_type the_module)
     ) prog;
+    log "Pass 1 complete.";
 
+    log "Pass 2: Defining all functions";
     (* Pass 2: Define all functions *)
     List.iter codegen_func_def prog;
+    log "Pass 2 complete.";
+
+    log "Codegen program finished.";
 
     the_module
 end
