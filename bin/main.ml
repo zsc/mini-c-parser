@@ -780,29 +780,21 @@ let run_normal_mode () =
 (* A verbose test run that prints intermediate stages for a hardcoded example *)
 let run_test_mode () =
   let input_code = "
-    // Swaps two integers using pointers.
-    int swap(int* a, int* b) {
-      int temp = *a;
-      *a = *b;
-      *b = temp;
-      return 0;
-    }
+int
+main()
+{
+    int x;
 
-    int main() {
-      int x = 10;
-      int y = 20;
-      swap(&x, &y);
-
-      // Loop to sum numbers. x should now be 20.
-      int i = 0;
-      int sum = 0;
-      for (i = 0; i < x; i = i + 1) {
-        sum = sum + i;
-        int dead_in_loop = 5; // Should be removed by DCE
-      }
-
-      return sum; // Should be 0+1+...+19 = 190
-    }
+    x = 1;
+    for(x = 10; x; x = x - 1)
+        ;
+    if(x)
+        return 1;
+    x = 10;
+    for (;x;)
+        x = x - 1;
+    return x;
+}
   " in
 
   print_endline "--- Mini-C Compiler (Test Mode) ---";
