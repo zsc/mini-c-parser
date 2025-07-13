@@ -247,6 +247,7 @@ module Ast_to_ssa = struct
     mutable current_block_side_effects: side_effect_instr list;
     mutable func_blocks: basic_block list;
     mutable current_bbid: bbid;
+    mutable is_sealed: bool; (* true if the current block is terminated *)
   }
 
   let new_reg ctx = let i = ctx.reg_counter in ctx.reg_counter <- i + 1; R i
@@ -260,6 +261,7 @@ module Ast_to_ssa = struct
     current_block_side_effects = [];
     func_blocks = [];
     current_bbid = L (-1); (* Invalid initial bbid *)
+    is_sealed = true; (* A new context has no open block to add to *)
   }
 
   (* Finalizes the current basic block and adds it to the function's list *)
@@ -273,12 +275,14 @@ module Ast_to_ssa = struct
     ctx.func_blocks <- new_block :: ctx.func_blocks;
     ctx.current_block_instrs <- [];
     ctx.current_block_side_effects <- [];
+    ctx.is_sealed <- true;
     ()
 
   (* Starts a new basic block *)
   let start_new_block ctx =
     let bbid = new_bbid ctx in
     ctx.current_bbid <- bbid;
+    ctx.is_sealed <- false;
     bbid
 
   let add_instr ctx def =
@@ -309,34 +313,47 @@ module Ast_to_ssa = struct
     | ArrayAccess (_, _) -> failwith "AST to SSA: Array access not implemented"
 
   let rec convert_stmt ctx (stmt: Ast.stmt) : unit =
-    match stmt with
-    | Return e ->
-        let op = convert_expr ctx e in
-        seal_block ctx (T_Ret op)
-    | If (cond, then_s, else_s_opt) ->
-        let cond_op = convert_expr ctx cond in
-        let then_bbid = new_bbid ctx in
-        let else_bbid = new_bbid ctx in
-        let merge_bbid = new_bbid ctx in
-        let else_dest = match else_s_opt with Some _ -> else_bbid | None -> merge_bbid in
+    if ctx.is_sealed then () (* Unreachable code, do nothing *)
+    else match stmt with
+      | Return e ->
+          let op = convert_expr ctx e in
+          seal_block ctx (T_Ret op)
+      | If (cond, then_s, else_s_opt) ->
+          let cond_op = convert_expr ctx cond in
+          let then_bbid = new_bbid ctx in
+          let else_bbid = new_bbid ctx in
+          let merge_bbid = new_bbid ctx in
+          let has_else = else_s_opt <> None in
+          let else_dest = if has_else then else_bbid else merge_bbid in
 
-        seal_block ctx (T_CBr (cond_op, then_bbid, else_dest));
+          seal_block ctx (T_CBr (cond_op, then_bbid, else_dest));
 
-        (* Then block *)
-        ctx.current_bbid <- then_bbid;
-        convert_stmt ctx then_s;
-        seal_block ctx (T_Br merge_bbid);
+          (* Then block *)
+          ctx.current_bbid <- then_bbid;
+          ctx.is_sealed <- false;
+          convert_stmt ctx then_s;
+          let then_reaches_merge = not ctx.is_sealed in
+          if then_reaches_merge then
+            seal_block ctx (T_Br merge_bbid);
 
-        (* Else block *)
-        (match else_s_opt with
-        | Some s ->
-            ctx.current_bbid <- else_bbid;
-            convert_stmt ctx s;
-            seal_block ctx (T_Br merge_bbid)
-        | None -> ());
+          (* Else block *)
+          let else_reaches_merge =
+            match else_s_opt with
+            | Some s ->
+                ctx.current_bbid <- else_bbid;
+                ctx.is_sealed <- false;
+                convert_stmt ctx s;
+                let reaches = not ctx.is_sealed in
+                if reaches then seal_block ctx (T_Br merge_bbid);
+                reaches
+            | None -> true (* No 'else', so control flow always goes to merge block on false cond *)
+          in
 
-        (* Start new merge block *)
-        ctx.current_bbid <- merge_bbid
+          (* The merge block becomes the new current block if it's reachable from either branch. *)
+          if then_reaches_merge || else_reaches_merge then (
+            ctx.current_bbid <- merge_bbid;
+            ctx.is_sealed <- false
+          ) (* Otherwise, both paths terminated, so subsequent code is unreachable and is_sealed is left as true. *)
 
     | Block stmts -> List.iter (convert_stmt ctx) stmts
     | Decl (_, name, init_opt) ->
@@ -397,7 +414,7 @@ module Ast_to_ssa = struct
     (* If the last block wasn't terminated, it implies the C function could
        flow off the end without a return, which is undefined behavior.
        We add a default return to make the IR well-formed. *)
-    if ctx.current_block_instrs <> [] || ctx.current_block_side_effects <> [] then begin
+    if not ctx.is_sealed then begin
        seal_block ctx (T_Ret (O_Cst 0))
     end;
 
@@ -526,9 +543,9 @@ module Codegen = struct
     | T_Br bbid -> [Printf.sprintf "  br label %%%s" (string_of_ssa_bbid bbid)]
     | T_CBr (cond_op, ltrue, lfalse) ->
         let s_cond = string_of_ssa_operand cond_op in
-        let i1_res = s_cond ^ ".i1" in
-        let cmp_instr = Printf.sprintf "  %s = icmp ne i32 %s, 0" i1_res s_cond in
-        let br_instr = Printf.sprintf "  br i1 %s, label %%%s, label %%%s" i1_res (string_of_ssa_bbid ltrue) (string_of_ssa_bbid lfalse) in
+        let i1_res_for_br = s_cond ^ ".br_cond" in
+        let cmp_instr = Printf.sprintf "  %s = icmp ne i32 %s, 0" i1_res_for_br s_cond in
+        let br_instr = Printf.sprintf "  br i1 %s, label %%%s, label %%%s" i1_res_for_br (string_of_ssa_bbid ltrue) (string_of_ssa_bbid lfalse) in
         [cmp_instr; br_instr]
 
   let codegen_bb (bb: basic_block) : string list =
