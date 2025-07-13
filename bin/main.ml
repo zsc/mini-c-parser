@@ -792,26 +792,75 @@ let read_all_from_channel chan =
   with End_of_file ->
     Buffer.contents buf
 
-(* The main compilation pipeline for normal operation (stdin to stdout) *)
-let run_normal_mode () =
-  let input_code = read_all_from_channel stdin in
+(* The main compilation pipeline. Can be run in verbose mode. *)
+let process_input input_code verbose is_test =
+  if verbose then (
+    let mode_str = if is_test then "(Test Mode)" else "(Normal Mode)" in
+    print_endline ("--- Mini-C Compiler " ^ mode_str ^ " ---");
+    print_endline "Input Code:";
+    print_endline "--------------------------";
+    print_endline input_code;
+    print_endline "--------------------------\n";
+  );
+
+  (* --- Phase 1: Parsing --- *)
+  if verbose then print_endline "PHASE 1: Parsing...";
   match parse_from_string input_code with
   | Error msg ->
-      prerr_endline msg;
+      prerr_endline ("Parsing failed: " ^ msg);
       exit 1
   | Ok ast ->
+      if verbose then (
+        print_endline "Successfully parsed. Generated AST:";
+        print_endline (string_of_program ast);
+        print_endline "\n--------------------------\n";
+      );
+
+      (* --- Phase 2: AST to SSA Conversion --- *)
+      if verbose then print_endline "PHASE 2: Converting AST to SSA IR...";
       let ssa_ir = Ast_to_ssa.convert_program ast in
+      if verbose then (
+        print_endline "Successfully generated SSA IR:";
+        print_endline (Ssa_printer.string_of_program ssa_ir);
+        print_endline "\n--------------------------\n";
+      );
+
+      (* --- Phase 3: Dead Code Elimination --- *)
+      if verbose then print_endline "PHASE 3: Running Dead Code Elimination...";
       let optimized_ssa_ir = List.map Dce.run_on_function ssa_ir in
+      if verbose then (
+        print_endline "SSA IR after DCE:";
+        print_endline (Ssa_printer.string_of_program optimized_ssa_ir);
+        print_endline "\n--------------------------\n";
+      );
+
+      (* --- Phase 4: Code Generation from SSA --- *)
+      if verbose then print_endline "PHASE 4: Generating LLVM IR from SSA...";
       match Codegen.codegen_program optimized_ssa_ir with
       | Error msg ->
-          prerr_endline msg;
+          prerr_endline ("Codegen failed: " ^ msg);
           exit 1
       | Ok ir_string ->
-          print_endline ir_string
+          if verbose then print_endline "Successfully generated LLVM IR from optimized SSA:";
+          print_endline ir_string;
+          if verbose then (
+            let output_filename = "output.ll" in
+            (try
+              let oc = open_out output_filename in
+              Printf.fprintf oc "%s\n" ir_string;
+              close_out oc;
+              Printf.printf "\nLLVM IR also written to %s\n" output_filename
+            with Sys_error err ->
+              Printf.eprintf "Error writing to file %s: %s\n" output_filename err);
+          )
 
-(* A verbose test run that prints intermediate stages for a hardcoded example *)
-let run_test_mode () =
-  let input_code = "
+let () =
+  let args = Array.to_list Sys.argv in
+  let is_test = List.mem "--test" args in
+  let is_verbose = List.mem "--verbose" args in
+
+  let input_code =
+    if is_test then "
 int
 main()
 {
@@ -823,60 +872,8 @@ main()
     while(x);
     return x;
 }
-  " in
-
-  print_endline "--- Mini-C Compiler (Test Mode) ---";
-  print_endline "Input Code:";
-  print_endline "--------------------------";
-  print_endline input_code;
-  print_endline "--------------------------\n";
-
-  (* --- Phase 1: Parsing --- *)
-  print_endline "PHASE 1: Parsing...";
-  match parse_from_string input_code with
-  | Error msg ->
-      print_endline ("Parsing failed: " ^ msg);
-      exit 1
-  | Ok ast ->
-      print_endline "Successfully parsed. Generated AST:";
-      print_endline (string_of_program ast);
-      print_endline "\n--------------------------\n";
-
-      (* --- Phase 2: AST to SSA Conversion --- *)
-      print_endline "PHASE 2: Converting AST to SSA IR...";
-      let ssa_ir = Ast_to_ssa.convert_program ast in
-      print_endline "Successfully generated SSA IR:";
-      print_endline (Ssa_printer.string_of_program ssa_ir);
-      print_endline "\n--------------------------\n";
-
-      (* --- Phase 3: Dead Code Elimination --- *)
-      print_endline "PHASE 3: Running Dead Code Elimination...";
-      let optimized_ssa_ir = List.map Dce.run_on_function ssa_ir in
-      print_endline "SSA IR after DCE:";
-      print_endline (Ssa_printer.string_of_program optimized_ssa_ir);
-      print_endline "\n--------------------------\n";
-
-      (* --- Phase 4: Code Generation from SSA --- *)
-      print_endline "PHASE 4: Generating LLVM IR from SSA...";
-      match Codegen.codegen_program optimized_ssa_ir with
-      | Error msg ->
-          print_endline ("Codegen failed: " ^ msg);
-          exit 1
-      | Ok ir_string ->
-          print_endline "Successfully generated LLVM IR from optimized SSA:";
-          print_endline ir_string;
-          let output_filename = "output.ll" in
-          (try
-            let oc = open_out output_filename in
-            Printf.fprintf oc "%s\n" ir_string;
-            close_out oc;
-            Printf.printf "\nLLVM IR also written to %s\n" output_filename
-          with Sys_error err ->
-            Printf.eprintf "Error writing to file %s: %s\n" output_filename err);
-          ()
-
-let () =
-  if Array.length Sys.argv > 1 && Sys.argv.(1) = "--test" then
-    run_test_mode ()
-  else
-    run_normal_mode ()
+      "
+    else
+      read_all_from_channel stdin
+  in
+  process_input input_code is_verbose is_test
