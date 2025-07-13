@@ -332,7 +332,7 @@ module Codegen = struct
           with Not_found -> failwith ("Codegen error: Unknown variable name: " ^ s)
         in
         let res_name = new_temp ctx in
-        let instr = Printf.sprintf "  %s = load i32, ptr %s, align 4" res_name ptr_name in
+        let instr = Printf.sprintf "  %s = load i32, i32* %s, align 4" res_name ptr_name in
         ([instr], res_name)
     | BinOp (op, e1, e2) ->
         log "Generating expr: BinOp";
@@ -410,11 +410,11 @@ module Codegen = struct
         let else_block, needs_end_label =
           match else_s_opt with
           | Some s ->
-              let else_instrs = codegen_stmt ctx s in
+              let else_instrs = codegen_stmt ctx s in (* This could be a single expression, no need for new variable *)
               let block = (else_label ^ ":") :: else_instrs @
                           (if has_terminator else_instrs then [] else [Printf.sprintf "  br label %%%s" end_label])
               in (block, true)
-          | None -> ([], not (has_terminator then_instrs))
+          | None -> ([], true) (* The 'false' path of the initial branch jumps to the end label, so it must be emitted. *)
         in
         let end_block = if needs_end_label then [end_label ^ ":"] else [] in
 
@@ -429,7 +429,7 @@ module Codegen = struct
             log (" -> Generating initializer for '" ^ name ^ "'");
             let (instrs, res) = codegen_expr ctx e in
             let ptr_name = Hashtbl.find ctx.symbol_table name in
-            let store_instr = Printf.sprintf "  store i32 %s, ptr %s, align 4" res ptr_name in
+            let store_instr = Printf.sprintf "  store i32 %s, i32* %s, align 4" res ptr_name in
             instrs @ [store_instr]
         | None -> [])
     | ArrayDecl _ -> failwith "Array declaration codegen not yet implemented"
@@ -442,7 +442,7 @@ module Codegen = struct
           | _ -> failwith "LHS of assignment must be a variable"
         in
         let (rhs_instrs, rhs_res) = codegen_expr ctx rhs in
-        let store_instr = Printf.sprintf "  store i32 %s, ptr %s, align 4" rhs_res ptr_name in
+        let store_instr = Printf.sprintf "  store i32 %s, i32* %s, align 4" rhs_res ptr_name in
         rhs_instrs @ [store_instr]
 
   (* Traverses the AST of a function body to find all local variable declarations. *)
@@ -475,7 +475,7 @@ module Codegen = struct
         let ptr_name = "%" ^ name ^ ".addr" in
         Hashtbl.add ctx.symbol_table name ptr_name;
         [ Printf.sprintf "  %s = alloca i32, align 4" ptr_name;
-          Printf.sprintf "  store i32 %%%s, ptr %s, align 4" name ptr_name ]
+          Printf.sprintf "  store i32 %%%s, i32* %s, align 4" name ptr_name ]
       ) fdef.params
     in
 
