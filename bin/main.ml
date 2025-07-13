@@ -465,6 +465,7 @@ module Ast_to_ssa = struct
         let then_decls = find_decls_in_stmt then_s in
         let else_decls = match else_s_opt with Some s -> find_decls_in_stmt s | None -> [] in
         then_decls @ else_decls
+    | While (_, body) -> find_decls_in_stmt body
     | Block stmts -> List.concat_map find_decls_in_stmt stmts
     | _ -> []
 
