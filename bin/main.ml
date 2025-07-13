@@ -317,9 +317,9 @@ module Codegen = struct
         let arg_vals = Array.of_list (List.map codegen_expr args) in
         (* The original code `Llvm.build_call callee ...` is correct for standard LLVM bindings
          * (where the first argument is the function's Llvm.llvalue).
-         * If `dune build` reports `Llvm.type_of callee` has type `Llvm.lltype` but `Llvm.llvalue` was expected,
+         * If `dune build` reports `callee` has type `Llvm.llvalue` but `Llvm.lltype` was expected,
          * it implies a highly unusual or very old LLVM binding version is in use. *)
-        Llvm.build_call callee arg_vals "calltmp" builder
+        Llvm.build_call (Llvm.type_of callee) callee arg_vals "calltmp" builder
     | ArrayAccess (_, _) -> failwith "Array access codegen not yet implemented"
 
   let rec codegen_stmt stmt =
