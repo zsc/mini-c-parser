@@ -23,12 +23,16 @@ open Ssa
 (* (Unaltered) *)
 
 type token =
-  | T_Int | T_Return | T_If | T_Else | T_Id of string | T_Num of int
+  | T_Int | T_Return | T_If | T_Else | T_While | T_For
+  | T_Id of string | T_Num of int
   | T_Plus | T_Minus | T_Star | T_Slash | T_Le | T_Eq | T_Ne | T_Lt | T_Gt | T_Ge
-  | T_Lparen | T_Rparen | T_Assign | T_Lbrace | T_Rbrace | T_Lbracket | T_Rbracket
+  | T_Lparen | T_Rparen | T_Assign | T_Lbrace | T_Rbrace | T_Lbracket | T_Rbracket | T_Ampersand
   | T_Comma | T_Semicolon | T_Eof
 
-let keyword_map = [ ("int", T_Int); ("return", T_Return); ("if", T_If); ("else", T_Else) ]
+let keyword_map = [
+  ("int", T_Int); ("return", T_Return); ("if", T_If); ("else", T_Else);
+  ("while", T_While); ("for", T_For)
+]
 
 let token_specs = [
   (Str.regexp "[ \t\n\r]+", fun _ -> None); (Str.regexp "//[^\n]*", fun _ -> None); (Str.regexp "/\\*.*?\\*/", fun _ -> None);
@@ -36,7 +40,7 @@ let token_specs = [
   (Str.regexp "[0-9]+", fun s -> Some (T_Num (int_of_string s)));
   (Str.regexp "<=", fun _ -> Some T_Le); (Str.regexp "==", fun _ -> Some T_Eq); (Str.regexp "!=", fun _ -> Some T_Ne);
   (Str.regexp ">=", fun _ -> Some T_Ge); (Str.regexp "<", fun _ -> Some T_Lt); (Str.regexp ">", fun _ -> Some T_Gt);
-  (Str.regexp "+", fun _ -> Some T_Plus); (Str.regexp "-", fun _ -> Some T_Minus); (Str.regexp "=", fun _ -> Some T_Assign);
+  (Str.regexp "+", fun _ -> Some T_Plus); (Str.regexp "-", fun _ -> Some T_Minus); (Str.regexp "&", fun _ -> Some T_Ampersand); (Str.regexp "=", fun _ -> Some T_Assign);
   (Str.regexp "*", fun _ -> Some T_Star); (Str.regexp "/", fun _ -> Some T_Slash); (Str.regexp "(", fun _ -> Some T_Lparen);
   (Str.regexp ")", fun _ -> Some T_Rparen); (Str.regexp "{", fun _ -> Some T_Lbrace); (Str.regexp "}", fun _ -> Some T_Rbrace);
   (Str.regexp "\\[", fun _ -> Some T_Lbracket); (Str.regexp "\\]", fun _ -> Some T_Rbracket);
@@ -68,12 +72,13 @@ exception Parser_error of string
 let fail_parse msg = raise (Parser_error msg)
 
 let string_of_token = function
-  | T_Int -> "T_Int" | T_Return -> "T_Return" | T_If -> "T_If" | T_Else -> "T_Else"
+  | T_Int -> "T_Int" | T_Return -> "T_Return" | T_If -> "T_If" | T_Else -> "T_Else" | T_While -> "T_While" | T_For -> "T_For"
   | T_Id s -> Printf.sprintf "T_Id(%s)" s | T_Num n -> Printf.sprintf "T_Num(%d)" n
   | T_Plus -> "T_Plus" | T_Minus -> "T_Minus" | T_Star -> "T_Star" | T_Slash -> "T_Slash"
   | T_Le -> "T_Le" | T_Eq -> "T_Eq" | T_Ne -> "T_Ne" | T_Lt -> "T_Lt" | T_Gt -> "T_Gt" | T_Ge -> "T_Ge"
   | T_Lparen -> "T_Lparen" | T_Rparen -> "T_Rparen" | T_Assign -> "T_Assign"
   | T_Lbrace -> "T_Lbrace" | T_Rbrace -> "T_Rbrace" | T_Lbracket -> "T_Lbracket" | T_Rbracket -> "T_Rbracket"
+  | T_Ampersand -> "T_Ampersand"
   | T_Comma -> "T_Comma" | T_Semicolon -> "T_Semicolon" | T_Eof -> "T_Eof"
 
 let expect token tokens =
@@ -100,9 +105,14 @@ and parse_top_level_def tokens =
   ({ ret_type = "int"; name; params; body }, rest6)
 
 and parse_type_name tokens = match tokens with
-  | T_Int :: T_Lbracket :: T_Rbracket :: rest -> ("int[]", rest)
-  | T_Int :: rest -> ("int", rest)
-  | _ -> fail_parse "Expected type name (e.g., 'int')"
+  | T_Int :: rest ->
+      let rec parse_pointers base_type toks =
+        match toks with
+        | T_Star :: r -> parse_pointers (base_type ^ "*") r
+        | _ -> (base_type, toks)
+      in
+      parse_pointers "int" rest
+  | _ -> fail_parse "Expected 'int' as base type"
 
 and parse_params tokens = match tokens with
   | T_Rparen :: _ -> ([], tokens)
@@ -128,6 +138,34 @@ and parse_stmt tokens = match tokens with
         | T_Else :: rest' -> let (stmt, rest'') = parse_stmt rest' in (Some stmt, rest'')
         | _ -> (None, rest4) in
       (If (cond, then_stmt, else_stmt), rest_final)
+  | T_While :: rest ->
+      let rest1 = expect T_Lparen rest in
+      let (cond, rest2) = parse_expr rest1 in
+      let rest3 = expect T_Rparen rest2 in
+      let (body, rest_final) = parse_stmt rest3 in
+      (While (cond, body), rest_final)
+  | T_For :: rest -> (* Desugar for loop into a while loop *)
+      let rest1 = expect T_Lparen rest in
+      (* Parse initializer: can be a declaration or expression stmt *)
+      let (init_stmt, rest2) = if List.hd rest1 = T_Semicolon then (Block [], rest1)
+                               else (let (s, r) = parse_stmt rest1 in (s,r)) in
+      let rest3 = expect T_Semicolon rest2 in
+      (* Parse condition *)
+      let (cond_expr, rest4) = if List.hd rest3 = T_Semicolon then (Cst 1, rest3) (* Empty cond is true *)
+                               else parse_expr rest3 in
+      let rest5 = expect T_Semicolon rest4 in
+      (* Parse post-loop expression *)
+      let (post_expr_opt, rest6) = if List.hd rest5 = T_Rparen then (None, rest5)
+                                   else (let (e,r) = parse_expr rest5 in (Some e, r)) in
+      let rest7 = expect T_Rparen rest6 in
+      let (body_stmt, rest_final) = parse_stmt rest7 in
+      (* Desugar: { init; while(cond) { body; post; } } *)
+      let post_stmt_opt = match post_expr_opt with
+        | Some e -> Some (ExprStmt e)
+        | None -> None in
+      let new_body = Block (match post_stmt_opt with Some s -> [body_stmt; s] | None -> [body_stmt]) in
+      let while_loop = While (cond_expr, new_body) in
+      (Block [init_stmt; while_loop], rest_final)
   | T_Lbrace :: rest ->
       let rec parse_stmts acc t = match t with
         | T_Rbrace :: rest' -> (Block (List.rev acc), rest')
@@ -190,6 +228,8 @@ and parse_multiplicative_expr tokens =
 and parse_unary_expr tokens = match tokens with
   | T_Minus :: r -> let (e, r') = parse_unary_expr r in (BinOp (Sub, Cst 0, e), r')
   | T_Plus :: r -> parse_unary_expr r
+  | T_Ampersand :: r -> let (e, r') = parse_unary_expr r in (AddrOf e, r')
+  | T_Star :: r -> let (e, r') = parse_unary_expr r in (Deref e, r')
   | _ -> parse_postfix_expr tokens
 and parse_postfix_expr tokens =
   let (base, rest) = parse_primary_expr tokens in
@@ -302,6 +342,13 @@ module Ast_to_ssa = struct
         let op2 = convert_expr ctx e2 in
         let res_reg = add_instr ctx (D_BinOp (op, op1, op2)) in
         O_Reg res_reg
+    | AddrOf (Id s) -> (* &var *)
+        let ptr_reg = Hashtbl.find ctx.var_map s in
+        O_Reg ptr_reg
+    | Deref e -> (* *ptr_expr *)
+        let ptr_op = convert_expr ctx e in
+        let res_reg = add_instr ctx (D_Load ptr_op) in
+        O_Reg res_reg
     | Call (name, args) ->
         let arg_ops = List.map (convert_expr ctx) args in
         let res_reg = add_instr ctx (D_Call (name, arg_ops)) in
@@ -314,6 +361,25 @@ module Ast_to_ssa = struct
       | Return e ->
           let op = convert_expr ctx e in
           seal_block ctx (T_Ret op)
+      | While (cond, body) ->
+          let cond_bbid = start_new_block ctx in
+          seal_block ctx (T_Br cond_bbid); (* Jump to condition check *)
+
+          (* Condition block *)
+          ctx.current_bbid <- cond_bbid;
+          ctx.is_sealed <- false;
+          let cond_op = convert_expr ctx cond in
+          let body_bbid = new_bbid ctx in
+          let after_bbid = new_bbid ctx in
+          seal_block ctx (T_CBr (cond_op, body_bbid, after_bbid));
+
+          (* Loop body block *)
+          ctx.current_bbid <- body_bbid; ctx.is_sealed <- false;
+          convert_stmt ctx body;
+          if not ctx.is_sealed then seal_block ctx (T_Br cond_bbid); (* Jump back to condition *)
+
+          (* After loop block *)
+          ctx.current_bbid <- after_bbid; ctx.is_sealed <- false
       | If (cond, then_s, else_s_opt) ->
           let cond_op = convert_expr ctx cond in
           let then_bbid = new_bbid ctx in
@@ -365,6 +431,9 @@ module Ast_to_ssa = struct
          | Id s ->
              let ptr_reg = Hashtbl.find ctx.var_map s in
              add_side_effect ctx (S_Store (O_Reg ptr_reg, rhs_op))
+         | Deref ptr_expr ->
+             let addr_op = convert_expr ctx ptr_expr in
+             add_side_effect ctx (S_Store (addr_op, rhs_op))
          | _ -> failwith "AST to SSA: Assignment to non-variable not implemented")
     | ExprStmt e ->
         let _ = convert_expr ctx e in ()
@@ -578,10 +647,13 @@ let rec string_of_expr = function
         | Le -> "<=" | Eq -> "==" | Ne -> "!=" | Lt -> "<" | Gt -> ">" | Ge -> ">=" in
       Printf.sprintf "(%s %s %s)" (string_of_expr e1) op_str (string_of_expr e2)
   | Call (n, args) -> Printf.sprintf "%s(%s)" n (String.concat ", " (List.map string_of_expr args))
+  | AddrOf e -> "&(" ^ (string_of_expr e) ^ ")"
+  | Deref e -> "*(" ^ (string_of_expr e) ^ ")"
   | ArrayAccess (b, i) -> Printf.sprintf "%s[%s]" (string_of_expr b) (string_of_expr i)
 
 let rec string_of_stmt indent = function
   | Return e -> indent ^ "Return " ^ (string_of_expr e) ^ ";"
+  | While (c, b) -> indent ^ "While (" ^ (string_of_expr c) ^ ")\n" ^ (string_of_stmt (indent ^ "  ") b)
   | If (c, t, e_opt) ->
       let else_str = match e_opt with None -> "" | Some s -> "\n" ^ indent ^ "Else\n" ^ (string_of_stmt (indent ^ "  ") s) in
       indent ^ "If (" ^ (string_of_expr c) ^ ")\n" ^ (string_of_stmt (indent ^ "  ") t) ^ else_str
@@ -633,18 +705,28 @@ let run_normal_mode () =
 (* A verbose test run that prints intermediate stages for a hardcoded example *)
 let run_test_mode () =
   let input_code = "
-    int fac(int n) {
-      int unused_declaration; // This alloca should be removed by DCE
-      if (n <= 1) {
-        return 1;
-      }
-      int dead = 42; // This should be removed by DCE
-      return n * fac(n-1);
+    // Swaps two integers using pointers.
+    int swap(int* a, int* b) {
+      int temp = *a;
+      *a = *b;
+      *b = temp;
+      return 0;
     }
 
     int main() {
-      int result = fac(4);
-      return result;
+      int x = 10;
+      int y = 20;
+      swap(&x, &y);
+
+      // Loop to sum numbers. x should now be 20.
+      int i = 0;
+      int sum = 0;
+      for (i = 0; i < x; i = i + 1) {
+        sum = sum + i;
+        int dead_in_loop = 5; // Should be removed by DCE
+      }
+
+      return sum; // Should be 0+1+...+19 = 190
     }
   " in
 

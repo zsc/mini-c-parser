@@ -15,11 +15,14 @@ type expr =
   | Id of string                    (* 标识符/变量: e.g., n *)
   | BinOp of binop * expr * expr    (* 二元运算: e.g., n * fac(n-1) *)
   | Call of string * expr list      (* 函数调用: e.g., fac(4) *)
+  | AddrOf of expr                  (* 取址操作: &v *)
+  | Deref of expr                   (* 解引用操作: *p *)
   | ArrayAccess of expr * expr      (* 数组元素访问: e.g., arr[index] *)
 
 (* 语句类型 *)
 type stmt =
   | Return of expr                  (* return 语句: e.g., return 1; *)
+  | While of expr * stmt            (* while 循环: while (cond) { body } *)
   | If of expr * stmt * stmt option (* if (cond) { then } else { else } *)
   | Block of stmt list              (* 代码块: { stmt1; stmt2; ... } *)
   | Decl of string * string * expr option (* 变量声明: e.g., int x; int x = 5; *)
