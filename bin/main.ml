@@ -470,20 +470,20 @@ module Codegen = struct
         let br_instr = Printf.sprintf "  br i1 %s, label %%%s, label %%%s" i1_res_for_br (string_of_ssa_bbid ltrue) (string_of_ssa_bbid lfalse) in
         [cmp_instr; br_instr]
 
-  let codegen_bb (f: func_def) (bb: basic_block) : string list =
+  let codegen_bb (f: func_def) (func_ret_type: c_type) (bb: basic_block) : string list =
     let label = (string_of_ssa_bbid bb.id) ^ ":" in
     let ops_code = List.concat_map (function
       | I_Instr i -> codegen_instr f.reg_types i
       | I_Side_Effect s -> [codegen_side_effect f.reg_types s]
       ) bb.ops in
-    let term = codegen_terminator f.ret_type bb.term in
+    let term = codegen_terminator func_ret_type bb.term in
     [label] @ ops_code @ term
 
   let codegen_func (f: func_def) : string =
     let func_info = Hashtbl.find Ast_to_ssa.func_return_types f.name in
     let param_strs = List.map (fun r -> (ll_type_of_c_type (Hashtbl.find f.reg_types r)) ^ " " ^ string_of_ssa_reg r) f.params in
     let signature = Printf.sprintf "define %s @%s(%s) {" (ll_type_of_c_type func_info.ret_type) f.name (String.concat ", " param_strs) in
-    let body_lines = List.concat_map (codegen_bb {f with ret_type = func_info.ret_type}) f.blocks in
+    let body_lines = List.concat_map (codegen_bb f func_info.ret_type) f.blocks in
     String.concat "\n" ([signature] @ body_lines @ ["}"])
 
   let codegen_program (prog: Ssa.program) : (string, string) result =
