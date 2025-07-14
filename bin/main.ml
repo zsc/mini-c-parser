@@ -362,6 +362,18 @@ module Codegen = struct
     | D_Alloca typ ->
         let ll_type = ll_type_of_ssa_type typ in
         [Printf.sprintf "  %s = alloca %s, align 4" dest_reg ll_type]
+    | D_ArrayAlloca (typ, size_op) ->
+        let ll_type = ll_type_of_ssa_type typ in
+        let s_size = string_of_ssa_operand size_op in
+        [Printf.sprintf "  %s = alloca %s, i32 %s, align 4" dest_reg ll_type s_size]
+    | D_GetElementPtr (base_op, index_op) ->
+        let ptr_type = Hashtbl.find reg_types (match base_op with O_Reg r -> r | _ -> failwith "GEP base must be a register") in
+        let pointee_type_str = get_pointee_type ptr_type in
+        let ll_pointee_type = ll_type_of_ssa_type pointee_type_str in
+        let ll_ptr_type = ll_type_of_ssa_type ptr_type in
+        let s_base = string_of_ssa_operand base_op in
+        let s_index = string_of_ssa_operand index_op in
+        [Printf.sprintf "  %s = getelementptr inbounds %s, %s %s, i32 %s" dest_reg ll_pointee_type ll_ptr_type s_base s_index]
     | D_Load addr_op ->
         let res_type_str = Hashtbl.find reg_types instr.reg in
         let ll_res_type = ll_type_of_ssa_type res_type_str in

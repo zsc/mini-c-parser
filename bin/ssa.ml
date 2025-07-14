@@ -52,6 +52,8 @@ module Ssa = struct
     | D_Phi of (operand * bbid) list
     (* Memory allocation on the stack, produces a pointer. *)
     | D_Alloca of string (* The type being allocated, e.g., "int", "int*" *)
+    | D_ArrayAlloca of string * operand
+    | D_GetElementPtr of operand * operand
     (* Load a value from a memory address (which is an operand). *)
     | D_Load of operand
     (* A 'Store' is not a definition because it doesn't produce a value.
@@ -135,6 +137,8 @@ module Dce = struct
     | D_Phi phis ->
         let ops = List.map (fun (op, _) -> op) phis in
         used_regs_from_operands ops
+    | D_ArrayAlloca (_, size_op) -> used_regs_from_operand size_op
+    | D_GetElementPtr (base, index) -> used_regs_from_operands [base; index]
     | D_Alloca _ -> []
     | D_Load addr_op -> used_regs_from_operand addr_op
 
@@ -185,6 +189,7 @@ module Dce = struct
     let is_alloca_reg r =
       match Hashtbl.find_opt reg_def_map r with
       | Some { def = D_Alloca _; _ } -> true
+      | Some { def = D_ArrayAlloca _; _ } -> true
       | _ -> false
     in
     List.iter (fun bb ->
@@ -301,6 +306,11 @@ module Ast_to_ssa = struct
     else
       failwith ("Cannot get pointee type of non-pointer type: " ^ ptr_type)
 
+let ends_with ~suffix s =
+  let suffix_len = String.length suffix in
+  let s_len = String.length s in
+  if s_len < suffix_len then false
+  else String.sub s (s_len - suffix_len) suffix_len = suffix
 
   type ssa_builder_context = {
     mutable reg_counter: int;
@@ -361,11 +371,16 @@ module Ast_to_ssa = struct
   let rec convert_expr ctx (expr: Ast.expr) : operand * string =
     match expr with
     | Cst i -> (O_Cst i, "int")
-    | Id s ->
-        let ptr_reg = Hashtbl.find ctx.var_map s in
+    | Id s -> (* Can be a variable or an array name *)
         let var_type = Hashtbl.find ctx.var_types s in
-        let res_reg = add_instr ctx (D_Load (O_Reg ptr_reg)) var_type in
-        (O_Reg res_reg, var_type)
+        let ptr_reg = Hashtbl.find ctx.var_map s in
+        if ends_with ~suffix:"[]" var_type then
+          (* Array decays to pointer to first element. The type becomes e.g., int* *)
+          (O_Reg ptr_reg, (String.sub var_type 0 (String.length var_type - 2)) ^ "*")
+        else
+          (* Normal variable, load its value *)
+          let res_reg = add_instr ctx (D_Load (O_Reg ptr_reg)) var_type in
+          (O_Reg res_reg, var_type)
     | BinOp (op, e1, e2) ->
         let (op1, _) = convert_expr ctx e1 in
         let (op2, _) = convert_expr ctx e2 in
@@ -379,8 +394,12 @@ module Ast_to_ssa = struct
              (O_Reg ptr_reg, var_type ^ "*")
          | Deref ptr_expr -> (* &( *p ) simplifies to p *)
              convert_expr ctx ptr_expr
-         | ArrayAccess (_, _) ->
-             failwith "AST to SSA: Address of array element not implemented"
+         | ArrayAccess (base, index) -> (* &arr[i] *)
+             let (base_op, base_type) = convert_expr ctx base in
+             let (index_op, _) = convert_expr ctx index in
+             let ptr_type = base_type in
+             let res_reg = add_instr ctx (D_GetElementPtr (base_op, index_op)) ptr_type in
+             (O_Reg res_reg, ptr_type)
          | _ ->
              failwith "AST to SSA: Cannot take address of a non-lvalue expression")
     | Deref e -> (* *ptr_expr *)
@@ -393,7 +412,14 @@ module Ast_to_ssa = struct
         (* Assuming all functions return int for now *)
         let res_reg = add_instr ctx (D_Call (name, arg_ops)) "int" in
         (O_Reg res_reg, "int")
-    | ArrayAccess (_, _) -> failwith "AST to SSA: Array access not implemented"
+    | ArrayAccess (base, index) ->
+        let (base_op, base_type) = convert_expr ctx base in
+        let (index_op, _) = convert_expr ctx index in
+        let ptr_type = base_type in (* e.g., int* *)
+        let pointee_type = get_pointee_type ptr_type in
+        let element_ptr_reg = add_instr ctx (D_GetElementPtr (base_op, index_op)) ptr_type in
+        let res_reg = add_instr ctx (D_Load (O_Reg element_ptr_reg)) pointee_type in
+        (O_Reg res_reg, pointee_type)
 
   let rec convert_stmt ctx (stmt: Ast.stmt) : unit =
     if ctx.is_sealed then () (* Unreachable code, do nothing *)
@@ -494,22 +520,32 @@ module Ast_to_ssa = struct
          | Deref ptr_expr ->
              let (addr_op, _) = convert_expr ctx ptr_expr in
              add_side_effect ctx (S_Store (addr_op, rhs_op))
-         | _ -> failwith "AST to SSA: Assignment to non-variable not implemented")
+         | ArrayAccess (base, index) ->
+            let (base_op, base_type) = convert_expr ctx base in
+            let (index_op, _) = convert_expr ctx index in
+            let ptr_type = base_type in
+            let element_ptr_reg = add_instr ctx (D_GetElementPtr (base_op, index_op)) ptr_type in
+            add_side_effect ctx (S_Store (O_Reg element_ptr_reg, rhs_op))
+         | _ -> failwith "AST to SSA: Assignment to non-lvalue not implemented")
     | ExprStmt e ->
         let _ = convert_expr ctx e in ()
-    | ArrayDecl _ -> failwith "AST to SSA: Array declaration not implemented"
+    | ArrayDecl (_, _, _) -> () (* Handled in pre-allocation phase *)
 
-  let rec find_decls_in_stmt (stmt: Ast.stmt) : (string * string) list =
+  (* Finds all local variable and array declarations within a statement.
+     Returns a list of (name, type, size_expr option).
+     For `int x;`, size_expr is None.
+     For `int arr[10];`, size_expr is Some(Cst 10). *)
+  let rec find_all_decls_in_stmt (stmt: Ast.stmt) : (string * (string * Ast.expr option)) list =
     match stmt with
-    | Decl (typ, name, _) -> [(name, typ)]
-    | ArrayDecl (typ, name, _) -> [(name, typ ^ "*")] (* Array decays to pointer *)
+    | Decl (typ, name, _) -> [(name, (typ, None))]
+    | ArrayDecl (typ, name, size) -> [(name, (typ, Some size))]
     | If (_, then_s, else_s_opt) ->
-        let then_decls = find_decls_in_stmt then_s in
-        let else_decls = match else_s_opt with Some s -> find_decls_in_stmt s | None -> [] in
+        let then_decls = find_all_decls_in_stmt then_s in
+        let else_decls = match else_s_opt with Some s -> find_all_decls_in_stmt s | None -> [] in
         then_decls @ else_decls
-    | DoWhile (body, _) -> find_decls_in_stmt body
-    | While (_, body) -> find_decls_in_stmt body
-    | Block stmts -> List.concat_map find_decls_in_stmt stmts
+    | DoWhile (body, _) -> find_all_decls_in_stmt body
+    | While (_, body) -> find_all_decls_in_stmt body
+    | Block stmts -> List.concat_map find_all_decls_in_stmt stmts
     | _ -> []
 
   let convert_func (fdef: Ast.top_level_def) : Ssa.func_def =
@@ -519,10 +555,12 @@ module Ast_to_ssa = struct
     let _ = start_new_block ctx in
 
     (* Gather all types of parameters and local variables *)
+    let all_decls = find_all_decls_in_stmt fdef.body in
     List.iter (fun (typ, name) -> Hashtbl.add ctx.var_types name typ) fdef.params;
-    let local_decls = find_decls_in_stmt fdef.body in
-    List.iter (fun (name, typ) -> Hashtbl.add ctx.var_types name typ) local_decls;
-
+    List.iter (fun (name, (typ, size_opt)) ->
+      let final_type = match size_opt with None -> typ | Some _ -> typ ^ "[]" in
+      Hashtbl.add ctx.var_types name final_type
+    ) all_decls;
 
     (* Process parameters *)
     let param_regs = List.map (fun (param_type, name) ->
@@ -536,11 +574,16 @@ module Ast_to_ssa = struct
     in
 
      (* Allocate space for all local variables *)
-    List.iter (fun (name, typ) ->
+    List.iter (fun (name, (typ, size_opt)) ->
       if not (Hashtbl.mem ctx.var_map name) then
-        let ptr_reg = add_instr ctx (D_Alloca typ) (typ ^ "*") in
-        Hashtbl.add ctx.var_map name ptr_reg
-    ) local_decls;
+        let ptr_reg = match size_opt with
+          | None ->
+              add_instr ctx (D_Alloca typ) (typ ^ "*")
+          | Some size_expr ->
+              let (size_op, _) = convert_expr ctx size_expr in
+              add_instr ctx (D_ArrayAlloca (typ, size_op)) (typ ^ "*")
+        in
+        Hashtbl.add ctx.var_map name ptr_reg) all_decls;
 
     (* Convert the function body *)
     convert_stmt ctx fdef.body;
@@ -584,6 +627,8 @@ module Ssa_printer = struct
     | D_Call (name, args) -> Printf.sprintf "call @%s(%s)" name (String.concat ", " (List.map string_of_operand args))
     | D_Phi phis -> "phi " ^ (String.concat ", " (List.map (fun (op, bbid) -> Printf.sprintf "[ %s, %s ]" (string_of_operand op) (string_of_bbid bbid)) phis))
     | D_Alloca typ -> Printf.sprintf "alloca %s" typ
+    | D_ArrayAlloca (typ, size) -> Printf.sprintf "alloca %s, %s" typ (string_of_operand size)
+    | D_GetElementPtr (base, index) -> Printf.sprintf "getelementptr %s, %s" (string_of_operand base) (string_of_operand index)
     | D_Load op -> Printf.sprintf "load %s" (string_of_operand op)
 
   let string_of_instruction instr =
