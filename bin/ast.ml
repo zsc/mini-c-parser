@@ -1,13 +1,14 @@
 (* file ast.ml *)
 (* 操作符类型 *)
 type binop =
-  | Add | Sub | Mul | Div
+  | Add | Sub | Mul | Div | Mod
   | Le  (* Less than or equal <= *)
   | Eq  (* Equal == *)
   | Ne  (* Not equal != *)
   | Lt  (* Less than < *)
   | Gt  (* Greater than > *)
   | Ge  (* Greater than or equal >= *)
+  | BitAnd | BitOr | BitXor
 
 (* 表达式类型 *)
 type expr =

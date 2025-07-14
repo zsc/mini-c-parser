@@ -614,11 +614,12 @@ module Ssa_printer = struct
   let string_of_bbid (L i) = "L" ^ string_of_int i
   let string_of_operand = function
     | O_Cst i -> string_of_int i
-    | O_Reg r -> string_of_reg r
+    | O_Reg r -> string_of_reg r 
     | O_Global s -> "@" ^ s
 
   let string_of_binop = function
     | Add -> "add" | Sub -> "sub" | Mul -> "mul" | Div -> "div"
+    | Mod -> "mod" | BitAnd -> "and" | BitOr -> "or" | BitXor -> "xor"
     | Le -> "le" | Eq -> "eq" | Ne -> "ne" | Lt -> "lt" | Gt -> "gt" | Ge -> "ge"
 
   let string_of_definition def =

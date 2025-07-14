@@ -24,9 +24,10 @@ open Ssa
 type token =
   | T_Int | T_Return | T_If | T_Else | T_While | T_For | T_Do
   | T_Id of string | T_Num of int
-  | T_Plus | T_Minus | T_Star | T_Slash | T_Le | T_Eq | T_Ne | T_Lt | T_Gt | T_Ge
+  | T_Plus | T_Minus | T_Star | T_Slash | T_Percent
+  | T_Le | T_Eq | T_Ne | T_Lt | T_Gt | T_Ge
   | T_Lparen | T_Rparen | T_Assign | T_Lbrace | T_Rbrace | T_Lbracket | T_Rbracket | T_Ampersand
-  | T_Comma | T_Semicolon | T_Eof
+  | T_Pipe | T_Caret | T_Comma | T_Semicolon | T_Eof
 
 let keyword_map = [
   ("int", T_Int); ("return", T_Return); ("if", T_If); ("else", T_Else);
@@ -39,9 +40,11 @@ let token_specs = [
   (Str.regexp "[0-9]+", fun s -> Some (T_Num (int_of_string s)));
   (Str.regexp "<=", fun _ -> Some T_Le); (Str.regexp "==", fun _ -> Some T_Eq); (Str.regexp "!=", fun _ -> Some T_Ne);
   (Str.regexp ">=", fun _ -> Some T_Ge); (Str.regexp "<", fun _ -> Some T_Lt); (Str.regexp ">", fun _ -> Some T_Gt);
-  (Str.regexp "+", fun _ -> Some T_Plus); (Str.regexp "-", fun _ -> Some T_Minus); (Str.regexp "&", fun _ -> Some T_Ampersand); (Str.regexp "=", fun _ -> Some T_Assign);
-  (Str.regexp "*", fun _ -> Some T_Star); (Str.regexp "/", fun _ -> Some T_Slash); (Str.regexp "(", fun _ -> Some T_Lparen);
-  (Str.regexp ")", fun _ -> Some T_Rparen); (Str.regexp "{", fun _ -> Some T_Lbrace); (Str.regexp "}", fun _ -> Some T_Rbrace);
+  (Str.regexp "[+]", fun _ -> Some T_Plus); (Str.regexp "-", fun _ -> Some T_Minus); (Str.regexp "&", fun _ -> Some T_Ampersand); (Str.regexp "=", fun _ -> Some T_Assign);
+  (Str.regexp "[*]", fun _ -> Some T_Star); (Str.regexp "/", fun _ -> Some T_Slash); (Str.regexp "[%]", fun _ -> Some T_Percent);
+  (Str.regexp "[|]", fun _ -> Some T_Pipe); (Str.regexp "[\\^]", fun _ -> Some T_Caret);
+  (Str.regexp "[(]", fun _ -> Some T_Lparen); (Str.regexp "[)]", fun _ -> Some T_Rparen);
+  (Str.regexp "[{]", fun _ -> Some T_Lbrace); (Str.regexp "[}]", fun _ -> Some T_Rbrace);
   (Str.regexp "\\[", fun _ -> Some T_Lbracket); (Str.regexp "\\]", fun _ -> Some T_Rbracket);
   (Str.regexp ",", fun _ -> Some T_Comma); (Str.regexp ";", fun _ -> Some T_Semicolon);
 ]
@@ -72,12 +75,12 @@ let fail_parse msg = raise (Parser_error msg)
 let string_of_token = function
   | T_Int -> "T_Int" | T_Return -> "T_Return" | T_If -> "T_If" | T_Else -> "T_Else" | T_While -> "T_While" | T_For -> "T_For" | T_Do -> "T_Do"
   | T_Id s -> Printf.sprintf "T_Id(%s)" s | T_Num n -> Printf.sprintf "T_Num(%d)" n
-  | T_Plus -> "T_Plus" | T_Minus -> "T_Minus" | T_Star -> "T_Star" | T_Slash -> "T_Slash"
+  | T_Plus -> "T_Plus" | T_Minus -> "T_Minus" | T_Star -> "T_Star" | T_Slash -> "T_Slash" | T_Percent -> "T_Percent"
   | T_Le -> "T_Le" | T_Eq -> "T_Eq" | T_Ne -> "T_Ne" | T_Lt -> "T_Lt" | T_Gt -> "T_Gt" | T_Ge -> "T_Ge"
   | T_Lparen -> "T_Lparen" | T_Rparen -> "T_Rparen" | T_Assign -> "T_Assign"
   | T_Lbrace -> "T_Lbrace" | T_Rbrace -> "T_Rbrace" | T_Lbracket -> "T_Lbracket" | T_Rbracket -> "T_Rbracket"
   | T_Ampersand -> "T_Ampersand"
-  | T_Comma -> "T_Comma" | T_Semicolon -> "T_Semicolon" | T_Eof -> "T_Eof"
+  | T_Pipe -> "T_Pipe" | T_Caret -> "T_Caret" | T_Comma -> "T_Comma" | T_Semicolon -> "T_Semicolon" | T_Eof -> "T_Eof"
 
 let expect token tokens =
   match tokens with
@@ -217,7 +220,22 @@ and parse_stmt tokens = match tokens with
         | _ -> fail_parse "Expected '=' or ';' after expression statement")
 
 and parse_expr tokens = parse_assign_expr tokens
-and parse_assign_expr tokens = parse_equality_expr tokens
+and parse_assign_expr tokens = parse_bitwise_or_expr tokens
+and parse_bitwise_or_expr tokens =
+  let rec loop lhs toks = match toks with
+    | T_Pipe :: r -> let (rhs, r') = parse_bitwise_xor_expr r in loop (BinOp (BitOr, lhs, rhs)) r'
+    | _ -> (lhs, toks)
+  in let (lhs, r) = parse_bitwise_xor_expr tokens in loop lhs r
+and parse_bitwise_xor_expr tokens =
+  let rec loop lhs toks = match toks with
+    | T_Caret :: r -> let (rhs, r') = parse_bitwise_and_expr r in loop (BinOp (BitXor, lhs, rhs)) r'
+    | _ -> (lhs, toks)
+  in let (lhs, r) = parse_bitwise_and_expr tokens in loop lhs r
+and parse_bitwise_and_expr tokens =
+  let rec loop lhs toks = match toks with
+    | T_Ampersand :: r -> let (rhs, r') = parse_equality_expr r in loop (BinOp (BitAnd, lhs, rhs)) r'
+    | _ -> (lhs, toks)
+  in let (lhs, r) = parse_equality_expr tokens in loop lhs r
 and parse_equality_expr tokens =
   let rec loop lhs toks = match toks with
     | T_Eq :: r -> let (rhs, r') = parse_relational_expr r in loop (BinOp (Eq, lhs, rhs)) r'
@@ -242,6 +260,7 @@ and parse_multiplicative_expr tokens =
   let rec loop lhs toks = match toks with
     | T_Star :: r -> let (rhs, r') = parse_unary_expr r in loop (BinOp (Mul, lhs, rhs)) r'
     | T_Slash :: r -> let (rhs, r') = parse_unary_expr r in loop (BinOp (Div, lhs, rhs)) r'
+    | T_Percent :: r -> let (rhs, r') = parse_unary_expr r in loop (BinOp (Mod, lhs, rhs)) r'
     | _ -> (lhs, toks)
   in let (lhs, r) = parse_unary_expr tokens in loop lhs r
 and parse_unary_expr tokens = match tokens with
@@ -321,6 +340,10 @@ module Codegen = struct
     | Sub -> "sub nsw"
     | Mul -> "mul nsw"
     | Div -> "sdiv"
+    | Mod -> "srem"
+    | BitAnd -> "and"
+    | BitOr -> "or"
+    | BitXor -> "xor"
     | Lt  -> "icmp slt"
     | Le  -> "icmp sle"
     | Gt  -> "icmp sgt"
@@ -433,8 +456,9 @@ end
 let rec string_of_expr = function
   | Cst n -> string_of_int n | Id s -> s
   | BinOp (op, e1, e2) ->
-      let op_str = match op with Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/"
-        | Le -> "<=" | Eq -> "==" | Ne -> "!=" | Lt -> "<" | Gt -> ">" | Ge -> ">=" in
+      let op_str = match op with Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%"
+        | Le -> "<=" | Eq -> "==" | Ne -> "!=" | Lt -> "<" | Gt -> ">" | Ge -> ">="
+        | BitAnd -> "&" | BitOr -> "|" | BitXor -> "^" in
       Printf.sprintf "(%s %s %s)" (string_of_expr e1) op_str (string_of_expr e2)
   | Call (n, args) -> Printf.sprintf "%s(%s)" n (String.concat ", " (List.map string_of_expr args))
   | AddrOf e -> "&(" ^ (string_of_expr e) ^ ")"
