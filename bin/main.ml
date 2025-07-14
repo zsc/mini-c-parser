@@ -399,8 +399,9 @@ module Codegen = struct
     | T_Br bbid -> [Printf.sprintf "  br label %%%s" (string_of_ssa_bbid bbid)]
     | T_CBr (cond_op, ltrue, lfalse) ->
         let s_cond = string_of_ssa_operand cond_op in
-        let i1_res_for_br = s_cond ^ ".br_cond" in
-        let cmp_instr = Printf.sprintf "  %s = icmp ne i32 %s, 0" i1_res_for_br s_cond in
+        let cond_type = "i32" in (* Assume all conditions are i32 for now *)
+        let i1_res_for_br = "%cond_i1_" ^ (string_of_ssa_bbid ltrue) in (* Unique name *)
+        let cmp_instr = Printf.sprintf "  %s = icmp ne %s %s, 0" i1_res_for_br cond_type s_cond in
         let br_instr = Printf.sprintf "  br i1 %s, label %%%s, label %%%s" i1_res_for_br (string_of_ssa_bbid ltrue) (string_of_ssa_bbid lfalse) in
         [cmp_instr; br_instr]
 
