@@ -421,62 +421,6 @@ module Ast_to_ssa = struct
   let add_side_effect ctx sei =
     ctx.current_block_ops <- I_Side_Effect sei :: ctx.current_block_ops
 
-  let rec convert_lval_to_ptr ctx (expr: Ast.expr) : operand * Ast.c_type =
-    match expr with
-    | Id s -> (* Local or global variable *)
-        if Hashtbl.mem ctx.var_map s then
-          let ptr_reg = Hashtbl.find ctx.var_map s in
-          let var_type = Hashtbl.find ctx.var_types s in
-          (O_Reg ptr_reg, TPtr var_type)
-        else if Hashtbl.mem global_symbols s then
-          match Hashtbl.find global_symbols s with
-          | GSymVar typ -> (O_Global s, TPtr typ)
-          | GSymArray elem_typ -> (O_Global s, TPtr (TArray (elem_typ, 0)))
-        else failwith ("convert_lval_to_ptr: Undeclared identifier " ^ s)
-    | Deref ptr_expr -> (* *p *)
-        convert_expr ctx ptr_expr
-    | ArrayAccess (base, index) -> (* arr[i] or p[i] *)
-        let (base_op, base_type) = convert_expr ctx base in
-        let (index_op, _) = convert_expr ctx index in
-        let elem_ptr_type = match base_type with
-          | TPtr t -> t
-          | TArray(t,_) -> t
-          | _ -> failwith "Array access on non-pointer/array type"
-        in
-        let elem_ptr_reg = add_instr ctx (D_GetElementPtr (base_op, [index_op])) (TPtr elem_ptr_type) in
-        (O_Reg elem_ptr_reg, TPtr elem_ptr_type)
-    | MemberAccess (base, field) -> (* s.f *)
-        let (base_ptr_op, base_ptr_type) = convert_lval_to_ptr ctx base in
-        let s_type = get_pointee_type base_ptr_type in
-        (match s_type with
-        | TStruct s_name ->
-            let info = Hashtbl.find struct_env s_name in
-            let finfo = Hashtbl.find info.s_members field in
-            let field_ptr_reg = add_instr ctx (D_GetElementPtr (base_ptr_op, [O_CstI 0; O_CstI finfo.f_index])) (TPtr finfo.f_type) in
-            (O_Reg field_ptr_reg, TPtr finfo.f_type)
-        | TUnion u_name ->
-            let info = Hashtbl.find union_env u_name in
-            let f_type = Hashtbl.find info.u_members field in
-            let field_ptr_reg = add_bitcast ctx base_ptr_op (TPtr f_type) in
-            (O_Reg field_ptr_reg, TPtr f_type)
-        | _ -> failwith "Member access on non-struct/union type")
-    | PtrMemberAccess (base, field) -> (* p->f *)
-        let (ptr_op, ptr_type) = convert_expr ctx base in
-        let s_type = get_pointee_type ptr_type in
-        (match s_type with
-        | TStruct s_name ->
-            let info = Hashtbl.find struct_env s_name in
-            let finfo = Hashtbl.find info.s_members field in
-            let field_ptr_reg = add_instr ctx (D_GetElementPtr (ptr_op, [O_CstI 0; O_CstI finfo.f_index])) (TPtr finfo.f_type) in
-            (O_Reg field_ptr_reg, TPtr finfo.f_type)
-        | TUnion u_name ->
-            let info = Hashtbl.find union_env u_name in
-            let f_type = Hashtbl.find info.u_members field in
-            let field_ptr_reg = add_bitcast ctx ptr_op (TPtr f_type) in
-            (O_Reg field_ptr_reg, TPtr f_type)
-        | _ -> failwith "Pointer member access on non-struct/union pointer type")
-    | _ -> failwith "Expression is not a valid l-value"
-
   let rec convert_expr ctx (expr: Ast.expr) : operand * Ast.c_type =
     match expr with
     | CstI i -> (O_CstI i, TInt)
@@ -555,6 +499,62 @@ module Ast_to_ssa = struct
         let ret_type = func_info.ret_type in
         let res_reg = add_instr ctx (D_Call (name, arg_ops)) ret_type in
         (O_Reg res_reg, ret_type)
+  and convert_lval_to_ptr ctx (expr: Ast.expr) : operand * Ast.c_type =
+    match expr with
+    | Id s -> (* Local or global variable *)
+        if Hashtbl.mem ctx.var_map s then
+          let ptr_reg = Hashtbl.find ctx.var_map s in
+          let var_type = Hashtbl.find ctx.var_types s in
+          (O_Reg ptr_reg, TPtr var_type)
+        else if Hashtbl.mem global_symbols s then
+          match Hashtbl.find global_symbols s with
+          | GSymVar typ -> (O_Global s, TPtr typ)
+          | GSymArray elem_typ -> (O_Global s, TPtr (TArray (elem_typ, 0)))
+        else failwith ("convert_lval_to_ptr: Undeclared identifier " ^ s)
+    | Deref ptr_expr -> (* *p *)
+        convert_expr ctx ptr_expr
+    | ArrayAccess (base, index) -> (* arr[i] or p[i] *)
+        let (base_op, base_type) = convert_expr ctx base in
+        let (index_op, _) = convert_expr ctx index in
+        let elem_ptr_type = match base_type with
+          | TPtr t -> t
+          | TArray(t,_) -> t
+          | _ -> failwith "Array access on non-pointer/array type"
+        in
+        let elem_ptr_reg = add_instr ctx (D_GetElementPtr (base_op, [index_op])) (TPtr elem_ptr_type) in
+        (O_Reg elem_ptr_reg, TPtr elem_ptr_type)
+    | MemberAccess (base, field) -> (* s.f *)
+        let (base_ptr_op, base_ptr_type) = convert_lval_to_ptr ctx base in
+        let s_type = get_pointee_type base_ptr_type in
+        (match s_type with
+        | TStruct s_name ->
+            let info = Hashtbl.find struct_env s_name in
+            let finfo = Hashtbl.find info.s_members field in
+            let field_ptr_reg = add_instr ctx (D_GetElementPtr (base_ptr_op, [O_CstI 0; O_CstI finfo.f_index])) (TPtr finfo.f_type) in
+            (O_Reg field_ptr_reg, TPtr finfo.f_type)
+        | TUnion u_name ->
+            let info = Hashtbl.find union_env u_name in
+            let f_type = Hashtbl.find info.u_members field in
+            let field_ptr_reg = add_bitcast ctx base_ptr_op (TPtr f_type) in
+            (O_Reg field_ptr_reg, TPtr f_type)
+        | _ -> failwith "Member access on non-struct/union type")
+    | PtrMemberAccess (base, field) -> (* p->f *)
+        let (ptr_op, ptr_type) = convert_expr ctx base in
+        let s_type = get_pointee_type ptr_type in
+        (match s_type with
+        | TStruct s_name ->
+            let info = Hashtbl.find struct_env s_name in
+            let finfo = Hashtbl.find info.s_members field in
+            let field_ptr_reg = add_instr ctx (D_GetElementPtr (ptr_op, [O_CstI 0; O_CstI finfo.f_index])) (TPtr finfo.f_type) in
+            (O_Reg field_ptr_reg, TPtr finfo.f_type)
+        | TUnion u_name ->
+            let info = Hashtbl.find union_env u_name in
+            let f_type = Hashtbl.find info.u_members field in
+            let field_ptr_reg = add_bitcast ctx ptr_op (TPtr f_type) in
+            (O_Reg field_ptr_reg, TPtr f_type)
+        | _ -> failwith "Pointer member access on non-struct/union pointer type")
+    | _ -> failwith "Expression is not a valid l-value"
+
 
   let rec convert_stmt ctx (stmt: Ast.stmt) : unit =
     if ctx.is_sealed then () (* Unreachable code, do nothing *)
@@ -750,7 +750,7 @@ module Ast_to_ssa = struct
     Hashtbl.clear enum_val_env;
     string_counter := 0;
 
-    let rec eval_const_expr = function
+    let eval_const_expr = function
       | CstI i -> i
       | Id s -> (try Hashtbl.find enum_val_env s with Not_found -> failwith ("Enum const not found: " ^ s))
       | _ -> failwith "Enum initializer must be a constant integer expression"
