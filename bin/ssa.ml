@@ -314,9 +314,22 @@ module Ast_to_ssa = struct
     | TArray (t, _) -> t
     | _ -> failwith ("Ast_to_ssa: Cannot get pointee type of non-pointer type")
 
-  (* Forward declaration needed for mutual recursion with size_of_type *)
-  let union_env : (string, 'info) Hashtbl.t = Hashtbl.create 8
+  (* Type environments *)
+  type field_info = { f_type: Ast.c_type; f_index: int }
+  type struct_info = { s_members: (string, field_info) Hashtbl.t }
+  type union_info = {
+    u_members: (string, Ast.c_type) Hashtbl.t;
+    u_size: int;
+    u_align: int;
+    u_ll_type: string;
+  }
 
+  let func_return_types : (string, Ast.func_def) Hashtbl.t = Hashtbl.create 8
+  let struct_env : (string, struct_info) Hashtbl.t = Hashtbl.create 8
+  let union_env : (string, union_info) Hashtbl.t = Hashtbl.create 8
+  let enum_val_env : (string, int) Hashtbl.t = Hashtbl.create 16
+
+  (* This needs to be declared after the environments it depends on are defined. *)
   let rec c_type_to_ll_string (t: c_type) : string =
     match t with
     | TVoid -> "void" | TChar -> "i8" | TInt -> "i32"
@@ -327,31 +340,12 @@ module Ast_to_ssa = struct
     | TEnum _ -> "i32" (* Enums are represented as integers *)
     | TArray (t, _) -> (c_type_to_ll_string t) ^ "*"
 
-  let func_return_types : (string, Ast.func_def) Hashtbl.t = Hashtbl.create 8
-
-  (* Type environments *)
-  type field_info = { f_type: Ast.c_type; f_index: int }
-  type struct_info = { s_members: (string, field_info) Hashtbl.t }
-  let struct_env : (string, struct_info) Hashtbl.t = Hashtbl.create 8
-
-  type union_info = {
-    u_members: (string, Ast.c_type) Hashtbl.t;
-    u_size: int;
-    u_align: int;
-    u_ll_type: string;
-  }
-  let () = Hashtbl.clear union_env (* Clear the forward-declared table to change its type *)
-  let union_env : (string, union_info) Hashtbl.t = Hashtbl.create 8
-
-  let enum_val_env : (string, int) Hashtbl.t = Hashtbl.create 16
-
   let rec size_of_type t = match t with
     | TVoid -> 0 | TChar -> 1 | TInt | TFloat | TEnum _ -> 4 | TDouble -> 8
     | TPtr _ -> 4 (* Assuming 32-bit pointers *)
     | TStruct s -> Hashtbl.find struct_env s |> (fun si -> si.s_members) |> Hashtbl.to_seq_values |> Seq.fold_left (fun acc f -> acc + size_of_type f.f_type) 0 (* Simplified; no padding *)
     | TUnion u -> (Hashtbl.find union_env u).u_size
     | TArray (et, n) -> n * size_of_type et
-
   type global_symbol_type =
     | GSymVar of Ast.c_type
     | GSymArray of Ast.c_type (* Element type *)
@@ -537,9 +531,30 @@ module Ast_to_ssa = struct
         let res_reg = add_instr ctx (D_Load ptr_op) pointee_type in
         (O_Reg res_reg, pointee_type)
     | Call (name, args) ->
-        let arg_ops = List.map (fun e -> fst (convert_expr ctx e)) args in
         let func_info = try Hashtbl.find func_return_types name with Not_found -> failwith ("Call to undeclared function: " ^ name) in
-        () (* TODO *)
+        let formal_param_types = List.map fst func_info.params in
+
+        let arg_ops =
+          List.mapi (fun i arg_expr ->
+            let (arg_op, arg_type) = convert_expr ctx arg_expr in
+            (* Handle type promotion/coercion for arguments *)
+            if i < List.length formal_param_types then
+              let formal_type = List.nth formal_param_types i in
+              if formal_type <> arg_type then
+                match formal_type, arg_type with
+                | (TFloat | TDouble), TInt -> O_Reg (add_instr ctx (D_SIToFP arg_op) formal_type)
+                | TInt, (TFloat | TDouble) -> O_Reg (add_instr ctx (D_FPToSI arg_op) formal_type)
+                | TPtr _, TPtr _ -> O_Reg (add_bitcast ctx arg_op formal_type)
+                | _ -> arg_op
+              else
+                arg_op
+            else
+              arg_op (* Variadic function argument, pass as is *)
+          ) args
+        in
+        let ret_type = func_info.ret_type in
+        let res_reg = add_instr ctx (D_Call (name, arg_ops)) ret_type in
+        (O_Reg res_reg, ret_type)
 
   let rec convert_stmt ctx (stmt: Ast.stmt) : unit =
     if ctx.is_sealed then () (* Unreachable code, do nothing *)
