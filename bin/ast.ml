@@ -24,6 +24,7 @@ type binop =
 type expr =
   | CstI of int                     (* 整型常量: e.g., 1, 42 *)
   | CstF of float                   (* 浮点型常量: e.g., 3.14 *)
+  | CstS of string                  (* 字符串字面量: e.g., "hello" *)
   | Id of string                    (* 标识符/变量: e.g., n *)
   | BinOp of binop * expr * expr    (* 二元运算: e.g., n * fac(n-1) *)
   | Call of string * expr list      (* 函数调用: e.g., fac(4) *)

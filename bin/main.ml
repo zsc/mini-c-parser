@@ -24,7 +24,7 @@ open Ssa
 type token =
   | T_Int | T_Char | T_Float | T_Double | T_Void
   | T_Return | T_If | T_Else | T_While | T_For | T_Do
-  | T_Id of string | T_Num of int | T_FNum of float
+  | T_Id of string | T_Num of int | T_FNum of float | T_String of string | T_Char_Lit of char
   | T_Plus | T_Minus | T_Star | T_Slash | T_Percent
   | T_Le | T_Eq | T_Ne | T_Lt | T_Gt | T_Ge
   | T_Lparen | T_Rparen | T_Assign | T_Lbrace | T_Rbrace | T_Lbracket | T_Rbracket | T_Ampersand
@@ -36,8 +36,63 @@ let keyword_map = [
   ("while", T_While); ("for", T_For); ("do", T_Do)
 ]
 
+(* Helper to unescape C-style string and char literals *)
+let unescape s =
+  let n = String.length s in
+  let buf = Buffer.create n in
+  let i = ref 0 in
+  while !i < n do
+    if s.[!i] = '\\' then (
+      i := !i + 1;
+      if !i < n then
+        let c = s.[!i] in
+        i := !i + 1;
+        match c with
+        | 'n' -> Buffer.add_char buf '\n'
+        | 't' -> Buffer.add_char buf '\t'
+        | 'r' -> Buffer.add_char buf '\r'
+        | '\\' -> Buffer.add_char buf '\\'
+        | '\'' -> Buffer.add_char buf '\''
+        | '"' -> Buffer.add_char buf '\"'
+        | '0' .. '7' as c1 ->
+          let v = ref (Char.code c1 - Char.code '0') in
+          if !i < n && s.[!i] >= '0' && s.[!i] <= '7' then (
+            v := !v * 8 + (Char.code s.[!i] - Char.code '0');
+            i := !i + 1;
+            if !i < n && s.[!i] >= '0' && s.[!i] <= '7' then (
+              v := !v * 8 + (Char.code s.[!i] - Char.code '0');
+              i := !i + 1;
+            )
+          );
+          Buffer.add_char buf (Char.chr !v)
+        | 'x' ->
+          let v = ref 0 in
+          let has_digit = ref false in
+          while !i < n && (let c_hex = s.[!i] in ('0' <= c_hex && c_hex <= '9') || ('a' <= c_hex && c_hex <= 'f') || ('A' <= c_hex && c_hex <= 'F')) do
+            has_digit := true;
+            let digit = s.[!i] in
+            let d_val = if '0' <= digit && digit <= '9' then Char.code digit - Char.code '0'
+                        else if 'a' <= digit && digit <= 'f' then Char.code digit - Char.code 'a' + 10
+                        else Char.code digit - Char.code 'A' + 10 in
+            v := !v * 16 + d_val;
+            i := !i + 1
+          done;
+          if not !has_digit then failwith "Invalid hex escape: '\\x' with no digits";
+          Buffer.add_char buf (Char.chr !v)
+        | c -> Buffer.add_char buf c (* Unknown escape sequence, just pass char *)
+      else
+        Buffer.add_char buf '\\'
+    ) else (
+      Buffer.add_char buf s.[!i];
+      i := !i + 1
+    )
+  done;
+  Buffer.contents buf
+
 let token_specs = [
   (Str.regexp "[ \t\n\r]+", fun _ -> None); (Str.regexp "#[^\n]*", fun _ -> None);
+  (Str.regexp "\"[^\"\\\\]*\\(\\\\.[^\"\\\\]*\\)*\"", fun s -> Some (T_String (unescape (String.sub s 1 (String.length s - 2)))));
+  (Str.regexp "'\\([^'\\\\]\\|\\\\.\\)+'", fun s -> Some (T_Char_Lit ((unescape (String.sub s 1 (String.length s - 2))).[0])));
   (Str.regexp "[a-zA-Z_][a-zA-Z0-9_]*", fun s -> try Some (List.assoc s keyword_map) with Not_found -> Some (T_Id s));
   (Str.regexp "[0-9]+\\.[0-9]*\\([eE][-+]?[0-9]+\\)?", fun s -> Some (T_FNum (float_of_string s)));
   (Str.regexp "[0-9]+", fun s -> Some (T_Num (int_of_string s)));
@@ -78,6 +133,7 @@ let fail_parse msg = raise (Parser_error msg)
 let string_of_token = function
   | T_Int -> "T_Int" | T_Char -> "T_Char" | T_Float -> "T_Float" | T_Double -> "T_Double" | T_Void -> "T_Void"
   | T_Return -> "T_Return" | T_If -> "T_If" | T_Else -> "T_Else" | T_While -> "T_While" | T_For -> "T_For" | T_Do -> "T_Do"
+  | T_String s -> Printf.sprintf "T_String(\"%s\")" (String.escaped s) | T_Char_Lit c -> Printf.sprintf "T_Char_Lit('%c')" c
   | T_Id s -> Printf.sprintf "T_Id(%s)" s | T_Num n -> Printf.sprintf "T_Num(%d)" n | T_FNum f -> Printf.sprintf "T_FNum(%f)" f
   | T_Plus -> "T_Plus" | T_Minus -> "T_Minus" | T_Star -> "T_Star" | T_Slash -> "T_Slash" | T_Percent -> "T_Percent"
   | T_Le -> "T_Le" | T_Eq -> "T_Eq" | T_Ne -> "T_Ne" | T_Lt -> "T_Lt" | T_Gt -> "T_Gt" | T_Ge -> "T_Ge"
@@ -296,7 +352,14 @@ and parse_postfix_expr tokens =
         loop (ArrayAccess (base_expr, index_expr)) rest''
     | _ -> (base_expr, tokens)
   in loop base rest
-and parse_primary_expr tokens = match tokens with | T_Num n :: rest -> (CstI n, rest)
+and parse_primary_expr tokens = match tokens with
+  | T_String s :: rest ->
+      let rec concat_strings acc toks = match toks with
+        | T_String s' :: rest' -> concat_strings (acc ^ s') rest'
+        | _ -> (CstS acc, toks)
+      in concat_strings s rest
+  | T_Char_Lit c :: rest -> (CstI (Char.code c), rest)
+  | T_Num n :: rest -> (CstI n, rest)
   | T_FNum f :: rest -> (CstF f, rest)
   | T_Id s :: rest -> (Id s, rest)
   | T_Lparen :: rest ->
@@ -375,7 +438,9 @@ module Codegen = struct
       | O_Reg r  -> Hashtbl.find func_reg_types r
       | O_CstI _ -> TInt
       | O_CstF _ -> TDouble
-      | O_Global _ -> failwith "Cannot get type of global"
+      | O_Global s ->
+        if String.starts_with ~prefix:".str." s then TPtr TChar
+        else failwith ("Codegen: Cannot determine type of global " ^ s)
     in
     match instr.def with
     | D_BinOp (op, o1, o2) ->
@@ -444,7 +509,9 @@ module Codegen = struct
       | O_Reg r  -> Hashtbl.find func_reg_types r
       | O_CstI _ -> TInt
       | O_CstF _ -> TDouble
-      | O_Global _ -> failwith "Cannot get type of global"
+      | O_Global s ->
+        if String.starts_with ~prefix:".str." s then TPtr TChar
+        else failwith ("Codegen: Cannot determine type of global " ^ s)
     in
     match sei with
     | S_Store (addr_op, val_op) ->
@@ -488,8 +555,27 @@ module Codegen = struct
 
   let codegen_program (prog: Ssa.program) : (string, string) result =
     try
+        let llvm_escape_string s =
+          let buf = Buffer.create (String.length s * 2) in
+          String.iter (fun c ->
+            let code = Char.code c in
+            if code >= 32 && code <= 126 && c <> '"' && c <> '\\' then
+              Buffer.add_char buf c
+            else
+              Printf.bprintf buf "\\%02X" code
+          ) s;
+          Buffer.contents buf
+        in
+        let global_defs =
+          Hashtbl.fold (fun str_val label acc ->
+            let escaped_str = llvm_escape_string (str_val ^ "\000") in
+            let len = String.length str_val + 1 in
+            let def = Printf.sprintf "@%s = private unnamed_addr constant [%d x i8] c\"%s\", align 1" label len escaped_str in
+            def :: acc
+          ) Ast_to_ssa.global_strings []
+        in
         let func_defs = List.map codegen_func prog in
-        let full_module = String.concat "\n\n" func_defs in
+        let full_module = String.concat "\n" global_defs ^ "\n\n" ^ String.concat "\n\n" func_defs in
         Ok full_module
     with
     | Failure msg -> Error ("Codegen failed: " ^ msg)
@@ -504,6 +590,7 @@ let rec string_of_c_type = function
 let rec string_of_expr = function
   | CstI n -> string_of_int n
   | CstF f -> string_of_float f
+  | CstS s -> "\"" ^ (String.escaped s) ^ "\""
   | Id s -> s
   | BinOp (op, e1, e2) ->
       let op_str = match op with Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%"

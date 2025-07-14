@@ -317,6 +317,8 @@ module Ast_to_ssa = struct
     | TPtr p -> (c_type_to_ll_string p) ^ "*"
 
   let func_return_types : (string, Ast.top_level_def) Hashtbl.t = Hashtbl.create 8
+  let global_strings : (string, string) Hashtbl.t = Hashtbl.create 8
+  let string_counter = ref 0
 
   type ssa_builder_context = {
     mutable reg_counter: int;
@@ -371,6 +373,14 @@ module Ast_to_ssa = struct
     Hashtbl.add ctx.reg_types reg typ;
     reg
 
+  let get_string_label s =
+    try Hashtbl.find global_strings s
+    with Not_found ->
+      let label = ".str." ^ string_of_int !string_counter in
+      incr string_counter;
+      Hashtbl.add global_strings s label;
+      label
+
   let add_side_effect ctx sei =
     ctx.current_block_ops <- I_Side_Effect sei :: ctx.current_block_ops
 
@@ -378,6 +388,10 @@ module Ast_to_ssa = struct
     match expr with
     | CstI i -> (O_CstI i, TInt)
     | CstF f -> (O_CstF f, TDouble) (* C float literals are double by default *)
+    | CstS s ->
+        let label = get_string_label s in
+        let ptr_type = TPtr TChar in
+        (O_Global label, ptr_type)
     | Id s -> (* Can be a variable or an array name *)
         let var_type = Hashtbl.find ctx.var_types s in
         let ptr_reg = Hashtbl.find ctx.var_map s in
@@ -628,6 +642,8 @@ module Ast_to_ssa = struct
   let convert_program (prog: Ast.program) : Ssa.program =
     (* First pass: collect all function signatures *)
     Hashtbl.clear func_return_types;
+    Hashtbl.clear global_strings;
+    string_counter := 0;
     List.iter (fun (fdef : Ast.top_level_def) -> Hashtbl.add func_return_types fdef.name fdef) prog;
     List.map convert_func prog
 end
