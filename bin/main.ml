@@ -161,8 +161,8 @@ let rec parse_program tokens : program * token list =
 
 and parse_top_level_def tokens =
   match tokens with
-  | T_Struct :: _ -> let (def, r) = parse_struct_union_def true tokens in (GStructDef def, r)
-  | T_Union :: _ -> let (def, r) = parse_struct_union_def false tokens in (GUnionDef def, r)
+  | T_Struct :: _ -> parse_struct_union_def true tokens
+  | T_Union :: _ -> parse_struct_union_def false tokens
   | T_Enum :: _ -> let (def, r) = parse_enum_def tokens in (GEnumDef def, r)
   | _ -> parse_var_or_func_def tokens
 
@@ -209,7 +209,7 @@ and parse_c_type tokens =
   parse_pointers base_type rest
 
 and parse_struct_union_def is_struct tokens =
-  let start_tok, rest0 = if is_struct then T_Struct, List.tl tokens else T_Union, List.tl tokens in
+  let _, rest0 = if is_struct then T_Struct, List.tl tokens else T_Union, List.tl tokens in
   let name, rest1 = match rest0 with T_Id s :: r -> s, r | _ -> fail_parse ("Expected " ^ (if is_struct then "struct" else "union") ^ " name") in
   let rest2 = expect T_Lbrace rest1 in
   let rec parse_members acc toks =
@@ -224,8 +224,8 @@ and parse_struct_union_def is_struct tokens =
   let members, rest3 = parse_members [] rest2 in
   let rest4 = expect T_Rbrace rest3 in
   let rest_final = expect T_Semicolon rest4 in
-  if is_struct then ({ s_name = name; s_members = members }, rest_final)
-  else ({ u_name = name; u_members = members }, rest_final)
+  if is_struct then (GStructDef { s_name = name; s_members = members }, rest_final)
+  else (GUnionDef { u_name = name; u_members = members }, rest_final)
 
 and parse_enum_def tokens =
   let rest0 = expect T_Enum tokens in
@@ -344,6 +344,9 @@ and parse_stmt tokens = match tokens with
            (Decl (decl_type, name, Some init_expr), r_final)
        | T_Semicolon :: r_final -> (Decl (decl_type, name, None), r_final) (* Corrected this line to align properly in git diff, no functional change *)
        | _ -> fail_parse "Malformed declaration")
+  | T_Struct :: _ | T_Union :: _ | T_Enum :: _ ->
+      (* Local type definitions not supported, treat as variable declaration *)
+      parse_stmt (T_Int :: (List.tl tokens)) (* HACK: Re-parse as int for simplicity *)
   | _ -> (* If it's not a keyword statement or declaration, it must be an expression-based one. *)
       let (lhs_expr, rest_expr) = parse_expr tokens in
       (match rest_expr with
@@ -353,9 +356,6 @@ and parse_stmt tokens = match tokens with
             (Assign(lhs_expr, rhs_expr), rest_final)
         | T_Semicolon :: rest_final -> (ExprStmt lhs_expr, rest_final)
         | _ -> fail_parse "Expected '=' or ';' after expression statement")
-  | T_Struct :: _ | T_Union :: _ | T_Enum :: _ ->
-      (* Local type definitions not supported, treat as variable declaration *)
-      parse_stmt (T_Int :: (List.tl tokens)) (* HACK: Re-parse as int for simplicity *)
 
 and parse_expr tokens = parse_assign_expr tokens
 and parse_assign_expr tokens = parse_bitwise_or_expr tokens
@@ -562,7 +562,7 @@ module Codegen = struct
         let dest_type = Hashtbl.find func_reg_types instr.reg in
         let ll_src_type = ll_type_of_c_type src_type in
         let ll_dest_type = ll_type_of_c_type dest_type in
-        [Printf.sprintf "  %s = fptosi %s %s to %s" dest_reg ll_src_type (string_of_ssa_operand op) ll_dest_type]
+        [Printf.sprintf "  %s = sitofp %s %s to %s" dest_reg ll_src_type (string_of_ssa_operand op) ll_dest_type]
     | D_GetElementPtr (base_op, index_ops) ->
         let ptr_c_type = get_op_type base_op in
         let pointee_c_type = get_pointee_type ptr_c_type in
@@ -579,14 +579,6 @@ module Codegen = struct
         let ll_src_type = ll_type_of_c_type src_type in
         let ll_dest_type = ll_type_of_c_type dest_type in
         [Printf.sprintf "  %s = fptosi %s %s to %s" dest_reg ll_src_type (string_of_ssa_operand op) ll_dest_type]
-    | D_GetElementPtr (base_op, index_op) ->
-        let ptr_c_type = get_op_type base_op in
-        let pointee_c_type = get_pointee_type ptr_c_type in
-        let ll_pointee_type = ll_type_of_c_type pointee_c_type in
-        let ll_ptr_type = ll_type_of_c_type ptr_c_type in
-        let s_base = string_of_ssa_operand base_op in
-        let s_index = string_of_ssa_operand index_op in
-        [Printf.sprintf "  %s = getelementptr inbounds %s, %s %s, i32 %s" dest_reg ll_pointee_type ll_ptr_type s_base s_index]
     | D_Load addr_op ->
         let res_c_type = Hashtbl.find func_reg_types instr.reg in
         let ll_res_type = ll_type_of_c_type res_c_type in
