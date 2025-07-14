@@ -37,7 +37,7 @@ let keyword_map = [
 ]
 
 let token_specs = [
-  (Str.regexp "[ \t\n\r]+", fun _ -> None); (Str.regexp "//[^\n]*", fun _ -> None); (Str.regexp "/\\*.*?\\*/", fun _ -> None);
+  (Str.regexp "[ \t\n\r]+", fun _ -> None); (Str.regexp "#[^\n]*", fun _ -> None);
   (Str.regexp "[a-zA-Z_][a-zA-Z0-9_]*", fun s -> try Some (List.assoc s keyword_map) with Not_found -> Some (T_Id s));
   (Str.regexp "[0-9]+\\.[0-9]*\\([eE][-+]?[0-9]+\\)?", fun s -> Some (T_FNum (float_of_string s)));
   (Str.regexp "[0-9]+", fun s -> Some (T_Num (int_of_string s)));
@@ -535,9 +535,6 @@ let string_of_def (d: top_level_def) =
 
 let string_of_program (p: program) = String.concat "\n\n" (List.map string_of_def p)
 
-
-(* Main Driver *)
-
 (* Helper to read all content from a channel *)
 let read_all_from_channel chan =
   let buf = Buffer.create 4096 in
@@ -550,6 +547,31 @@ let read_all_from_channel chan =
   with End_of_file ->
     Buffer.contents buf
 
+(* Helper to run cpp for preprocessing *)
+let preprocess_with_cpp code =
+  try
+    let in_filename = Filename.temp_file "minic_in_" ".c" in
+    let out = open_out in_filename in
+    output_string out code;
+    close_out out;
+
+    let cpp_command = Printf.sprintf "cpp %s" in_filename in
+    let ic = Unix.open_process_in cpp_command in
+    let preprocessed_code = read_all_from_channel ic in
+    let status = Unix.close_process_in ic in
+    Sys.remove in_filename;
+
+    match status with
+    | WEXITED 0 -> Ok preprocessed_code
+    | WEXITED n -> Error (Printf.sprintf "cpp failed with exit code %d" n)
+    | WSIGNALED n -> Error (Printf.sprintf "cpp killed by signal %d" n)
+    | WSTOPPED n -> Error (Printf.sprintf "cpp stopped by signal %d" n)
+  with
+  | e -> Error (Printexc.to_string e)
+
+
+(* Main Driver *)
+
 (* The main compilation pipeline. Can be run in verbose mode. *)
 let process_input input_code verbose is_test =
   if verbose then (
@@ -561,9 +583,25 @@ let process_input input_code verbose is_test =
     print_endline "--------------------------\n";
   );
 
+  (* --- Phase 0: Preprocessing --- *)
+  let preprocessed_code =
+    if verbose then print_endline "PHASE 0: Preprocessing with cpp...";
+    match preprocess_with_cpp input_code with
+    | Ok code ->
+        if verbose then (
+          print_endline "Successfully preprocessed. Code after cpp:";
+          print_endline "--------------------------";
+          print_endline code;
+          print_endline "--------------------------\n";
+        );
+        code
+    | Error msg ->
+        prerr_endline ("Preprocessing failed: " ^ msg);
+        exit 1
+  in
   (* --- Phase 1: Parsing --- *)
   if verbose then print_endline "PHASE 1: Parsing...";
-  match parse_from_string input_code with
+  match parse_from_string preprocessed_code with
   | Error msg ->
       prerr_endline ("Parsing failed: " ^ msg);
       exit 1
