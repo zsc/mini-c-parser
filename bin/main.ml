@@ -418,6 +418,7 @@ module Codegen = struct
     | TFloat -> "float"
     | TDouble -> "double"
     | TPtr t -> (ll_type_of_c_type t) ^ "*"
+    | TArray (t, _) -> (ll_type_of_c_type t) ^ "*"
 
   let string_of_ssa_operand (op: operand) : string =
     match op with
@@ -551,7 +552,7 @@ module Codegen = struct
         let br_instr = Printf.sprintf "  br i1 %s, label %%%s, label %%%s" i1_res_for_br (string_of_ssa_bbid ltrue) (string_of_ssa_bbid lfalse) in
         [cmp_instr; br_instr]
 
-  let codegen_bb (f: func_def) (func_ret_type: c_type) (bb: basic_block) : string list =
+  let codegen_bb (f: Ssa.func_def) (func_ret_type: c_type) (bb: basic_block) : string list =
     let label = (string_of_ssa_bbid bb.id) ^ ":" in
     let ops_code = List.concat_map (function
       | I_Instr i -> codegen_instr f.reg_types i
@@ -560,7 +561,7 @@ module Codegen = struct
     let term = codegen_terminator func_ret_type bb.term in
     [label] @ ops_code @ term
 
-  let codegen_func (f: func_def) : string =
+  let codegen_func (f: Ssa.func_def) : string =
     let func_info = Hashtbl.find Ast_to_ssa.func_return_types f.name in
     let param_strs = List.map (fun r -> (ll_type_of_c_type (Hashtbl.find f.reg_types r)) ^ " " ^ string_of_ssa_reg r) f.params in
     let signature = Printf.sprintf "define %s @%s(%s) {" (ll_type_of_c_type func_info.ret_type) f.name (String.concat ", " param_strs) in
@@ -617,6 +618,7 @@ let rec string_of_c_type = function
   | TVoid -> "void" | TChar -> "char" | TInt -> "int"
   | TFloat -> "float" | TDouble -> "double"
   | TPtr t -> (string_of_c_type t) ^ "*"
+  | TArray (t, n) -> Printf.sprintf "%s[%d]" (string_of_c_type t) n
 
 let rec string_of_expr = function
   | CstI n -> string_of_int n

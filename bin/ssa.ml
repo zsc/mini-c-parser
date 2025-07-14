@@ -700,6 +700,7 @@ module Ssa_printer = struct
     | TVoid -> "void" | TChar -> "char" | TInt -> "int"
     | TFloat -> "float" | TDouble -> "double"
     | TPtr p -> (string_of_c_type p) ^ "*"
+    | TArray (elem_t, size) -> Printf.sprintf "%s[%d]" (string_of_c_type elem_t) size
 
   let string_of_reg (R i) = "%r" ^ string_of_int i
   let string_of_bbid (L i) = "L" ^ string_of_int i
