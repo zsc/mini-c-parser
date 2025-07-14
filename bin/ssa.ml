@@ -8,6 +8,7 @@
   This IR is designed to be independent of LLVM.
 *)
 
+open Ast (* For c_type *)
 open Ast (* For reusing the binop type *)
 
 (*
@@ -33,7 +34,8 @@ module Ssa = struct
   (* Operands are the inputs to instructions. They can be a constant,
      the value from a register, or a global name (like a function). *)
   type operand =
-    | O_Cst of int
+    | O_CstI of int
+    | O_CstF of float
     | O_Reg of reg
     | O_Global of string
 
@@ -54,6 +56,8 @@ module Ssa = struct
     | D_Alloca of string (* The type being allocated, e.g., "int", "int*" *)
     | D_ArrayAlloca of string * operand
     | D_GetElementPtr of operand * operand
+    | D_SIToFP of operand (* Signed Integer to Floating Point conversion *)
+    | D_FPToSI of operand (* Floating Point to Signed Integer conversion *)
     (* Load a value from a memory address (which is an operand). *)
     | D_Load of operand
     (* A 'Store' is not a definition because it doesn't produce a value.
@@ -102,7 +106,7 @@ module Ssa = struct
     name: string;
     params: reg list; (* Parameters are passed in registers. *)
     blocks: basic_block list;
-    reg_types: (reg, string) Hashtbl.t;
+    reg_types: (reg, Ast.c_type) Hashtbl.t;
   }
 
   (* A program is a list of function definitions. *)
@@ -123,7 +127,7 @@ module Dce = struct
   let used_regs_from_operand op =
     match op with
     | O_Reg r -> [r]
-    | O_Cst _ | O_Global _ -> []
+    | O_CstI _ | O_CstF _ | O_Global _ -> []
 
   (* Helper to extract all registers used by a list of operands. *)
   let used_regs_from_operands ops =
@@ -139,6 +143,8 @@ module Dce = struct
         used_regs_from_operands ops
     | D_ArrayAlloca (_, size_op) -> used_regs_from_operand size_op
     | D_GetElementPtr (base, index) -> used_regs_from_operands [base; index]
+    | D_SIToFP op -> used_regs_from_operand op
+    | D_FPToSI op -> used_regs_from_operand op
     | D_Alloca _ -> []
     | D_Load addr_op -> used_regs_from_operand addr_op
 
@@ -297,20 +303,21 @@ end
 
 (* AST to SSA Conversion *)
 module Ast_to_ssa = struct
+  open Ast
   open Ssa
 
-  let get_pointee_type (ptr_type: string) : string =
-    let len = String.length ptr_type in
-    if len > 0 && ptr_type.[len - 1] = '*' then
-      String.sub ptr_type 0 (len - 1)
-    else
-      failwith ("Cannot get pointee type of non-pointer type: " ^ ptr_type)
+  let get_pointee_type (ptr_type: Ast.c_type) : Ast.c_type =
+    match ptr_type with
+    | TPtr t -> t
+    | _ -> failwith ("Ast_to_ssa: Cannot get pointee type of non-pointer type")
 
-let ends_with ~suffix s =
-  let suffix_len = String.length suffix in
-  let s_len = String.length s in
-  if s_len < suffix_len then false
-  else String.sub s (s_len - suffix_len) suffix_len = suffix
+  let rec c_type_to_ll_string (t: c_type) : string =
+    match t with
+    | TVoid -> "void" | TChar -> "i8" | TInt -> "i32"
+    | TFloat -> "float" | TDouble -> "double"
+    | TPtr p -> (c_type_to_ll_string p) ^ "*"
+
+  let func_return_types : (string, Ast.top_level_def) Hashtbl.t = Hashtbl.create 8
 
   type ssa_builder_context = {
     mutable reg_counter: int;
@@ -320,8 +327,8 @@ let ends_with ~suffix s =
     mutable func_blocks: basic_block list;
     mutable current_bbid: bbid;
     mutable is_sealed: bool; (* true if the current block is terminated *)
-    var_types: (string, string) Hashtbl.t; (* var name -> type string *)
-    reg_types: (reg, string) Hashtbl.t; (* reg -> type string *)
+    var_types: (string, Ast.c_type) Hashtbl.t; (* var name -> type *)
+    reg_types: (reg, Ast.c_type) Hashtbl.t; (* reg -> type *)
   }
 
   let new_reg ctx = let i = ctx.reg_counter in ctx.reg_counter <- i + 1; R i
@@ -358,7 +365,7 @@ let ends_with ~suffix s =
     ctx.is_sealed <- false;
     bbid
 
-  let add_instr ctx def typ =
+  let add_instr ctx def typ : reg =
     let reg = new_reg ctx in
     let instr = { reg; def } in
     ctx.current_block_ops <- I_Instr instr :: ctx.current_block_ops;
@@ -368,38 +375,48 @@ let ends_with ~suffix s =
   let add_side_effect ctx sei =
     ctx.current_block_ops <- I_Side_Effect sei :: ctx.current_block_ops
 
-  let rec convert_expr ctx (expr: Ast.expr) : operand * string =
+  let rec convert_expr ctx (expr: Ast.expr) : operand * Ast.c_type =
     match expr with
-    | Cst i -> (O_Cst i, "int")
+    | CstI i -> (O_CstI i, TInt)
+    | CstF f -> (O_CstF f, TDouble) (* C float literals are double by default *)
     | Id s -> (* Can be a variable or an array name *)
         let var_type = Hashtbl.find ctx.var_types s in
         let ptr_reg = Hashtbl.find ctx.var_map s in
-        if ends_with ~suffix:"[]" var_type then
-          (* Array decays to pointer to first element. The type becomes e.g., int* *)
-          (O_Reg ptr_reg, (String.sub var_type 0 (String.length var_type - 2)) ^ "*")
-        else
-          (* Normal variable, load its value *)
-          let res_reg = add_instr ctx (D_Load (O_Reg ptr_reg)) var_type in
-          (O_Reg res_reg, var_type)
+        let res_reg = add_instr ctx (D_Load (O_Reg ptr_reg)) var_type in
+        (O_Reg res_reg, var_type)
     | BinOp (op, e1, e2) ->
-        let (op1, _) = convert_expr ctx e1 in
-        let (op2, _) = convert_expr ctx e2 in
-        let res_reg = add_instr ctx (D_BinOp (op, op1, op2)) "int" in
-        (O_Reg res_reg, "int")
+        let (op1, t1) = convert_expr ctx e1 in
+        let (op2, t2) = convert_expr ctx e2 in
+        let is_float_op = match t1, t2 with
+          | TFloat, _ | TDouble, _ | _, TFloat | _, TDouble -> true
+          | _, _ -> false
+        in
+        let final_type, final_op1, final_op2 =
+          if is_float_op then
+            let coerce_to_float op ty target_ty =
+              if ty = TInt then O_Reg (add_instr ctx (D_SIToFP op) target_ty) else op
+            in
+            let float_type = if t1 = TDouble || t2 = TDouble then TDouble else TFloat in
+            let new_op1 = coerce_to_float op1 t1 float_type in
+            let new_op2 = coerce_to_float op2 t2 float_type in
+            (float_type, new_op1, new_op2)
+          else (t1, op1, op2) (* Assume int-like types *)
+        in
+        let res_reg = add_instr ctx (D_BinOp (op, final_op1, final_op2)) final_type in
+        (O_Reg res_reg, final_type)
     | AddrOf e ->
         (match e with
          | Id s -> (* &var *)
              let ptr_reg = Hashtbl.find ctx.var_map s in
              let var_type = Hashtbl.find ctx.var_types s in
-             (O_Reg ptr_reg, var_type ^ "*")
+             (O_Reg ptr_reg, TPtr var_type)
          | Deref ptr_expr -> (* &( *p ) simplifies to p *)
              convert_expr ctx ptr_expr
          | ArrayAccess (base, index) -> (* &arr[i] *)
              let (base_op, base_type) = convert_expr ctx base in
              let (index_op, _) = convert_expr ctx index in
-             let ptr_type = base_type in
-             let res_reg = add_instr ctx (D_GetElementPtr (base_op, index_op)) ptr_type in
-             (O_Reg res_reg, ptr_type)
+             let res_reg = add_instr ctx (D_GetElementPtr (base_op, index_op)) base_type in
+             (O_Reg res_reg, base_type)
          | _ ->
              failwith "AST to SSA: Cannot take address of a non-lvalue expression")
     | Deref e -> (* *ptr_expr *)
@@ -409,15 +426,17 @@ let ends_with ~suffix s =
         (O_Reg res_reg, pointee_type)
     | Call (name, args) ->
         let arg_ops = List.map (fun e -> fst (convert_expr ctx e)) args in
-        (* Assuming all functions return int for now *)
-        let res_reg = add_instr ctx (D_Call (name, arg_ops)) "int" in
-        (O_Reg res_reg, "int")
+        let func_info = try Hashtbl.find func_return_types name with Not_found -> failwith ("Call to undeclared function: " ^ name) in
+        let res_reg = add_instr ctx (D_Call (name, arg_ops)) func_info.ret_type in
+        (O_Reg res_reg, func_info.ret_type)
     | ArrayAccess (base, index) ->
-        let (base_op, base_type) = convert_expr ctx base in
+        let (base_op, ptr_type) = convert_expr ctx base in
         let (index_op, _) = convert_expr ctx index in
-        let ptr_type = base_type in (* e.g., int* *)
-        let pointee_type = get_pointee_type ptr_type in
-        let element_ptr_reg = add_instr ctx (D_GetElementPtr (base_op, index_op)) ptr_type in
+        let elem_ptr_type = match ptr_type with
+          | TPtr t -> TPtr t | _ -> failwith "Array access on non-pointer type"
+        in
+        let element_ptr_reg = add_instr ctx (D_GetElementPtr (base_op, index_op)) elem_ptr_type in
+        let pointee_type = get_pointee_type elem_ptr_type in
         let res_reg = add_instr ctx (D_Load (O_Reg element_ptr_reg)) pointee_type in
         (O_Reg res_reg, pointee_type)
 
@@ -512,21 +531,27 @@ let ends_with ~suffix s =
              add_side_effect ctx (S_Store (O_Reg ptr_reg, val_op))
          | None -> ())
     | Assign (lhs, rhs) ->
-        let (rhs_op, _) = convert_expr ctx rhs in
-        (match lhs with
-         | Id s ->
-             let ptr_reg = Hashtbl.find ctx.var_map s in
-             add_side_effect ctx (S_Store (O_Reg ptr_reg, rhs_op))
-         | Deref ptr_expr ->
-             let (addr_op, _) = convert_expr ctx ptr_expr in
-             add_side_effect ctx (S_Store (addr_op, rhs_op))
-         | ArrayAccess (base, index) ->
-            let (base_op, base_type) = convert_expr ctx base in
-            let (index_op, _) = convert_expr ctx index in
-            let ptr_type = base_type in
-            let element_ptr_reg = add_instr ctx (D_GetElementPtr (base_op, index_op)) ptr_type in
-            add_side_effect ctx (S_Store (O_Reg element_ptr_reg, rhs_op))
-         | _ -> failwith "AST to SSA: Assignment to non-lvalue not implemented")
+        let (rhs_op, rhs_type) = convert_expr ctx rhs in
+        let get_lval_ptr_and_type = function
+          | Id s -> (O_Reg (Hashtbl.find ctx.var_map s), Hashtbl.find ctx.var_types s)
+          | Deref ptr_expr -> let (addr_op, ptr_type) = convert_expr ctx ptr_expr in (addr_op, get_pointee_type ptr_type)
+          | ArrayAccess (base, index) ->
+              let (base_op, ptr_type) = convert_expr ctx base in
+              let (index_op, _) = convert_expr ctx index in
+              let elem_ptr_type = match ptr_type with TPtr t -> TPtr t | _ -> failwith "Array assign to non-pointer" in
+              let elem_ptr_reg = add_instr ctx (D_GetElementPtr (base_op, index_op)) elem_ptr_type in
+              (O_Reg elem_ptr_reg, get_pointee_type elem_ptr_type)
+          | _ -> failwith "AST to SSA: Assignment to non-lvalue not implemented"
+        in
+        let (lval_ptr_op, lval_type) = get_lval_ptr_and_type lhs in
+        let final_rhs_op = if lval_type <> rhs_type then (* Basic type coercion *)
+          match lval_type, rhs_type with
+          | (TFloat|TDouble), TInt -> O_Reg (add_instr ctx (D_SIToFP rhs_op) lval_type)
+          | TInt, (TFloat|TDouble) -> O_Reg (add_instr ctx (D_FPToSI rhs_op) lval_type)
+          | _, _ -> rhs_op
+        else rhs_op
+        in
+        add_side_effect ctx (S_Store (lval_ptr_op, final_rhs_op))
     | ExprStmt e ->
         let _ = convert_expr ctx e in ()
     | ArrayDecl (_, _, _) -> () (* Handled in pre-allocation phase *)
@@ -534,8 +559,8 @@ let ends_with ~suffix s =
   (* Finds all local variable and array declarations within a statement.
      Returns a list of (name, type, size_expr option).
      For `int x;`, size_expr is None.
-     For `int arr[10];`, size_expr is Some(Cst 10). *)
-  let rec find_all_decls_in_stmt (stmt: Ast.stmt) : (string * (string * Ast.expr option)) list =
+     For `int arr[10];`, size_expr is Some(CstI 10). *)
+  let rec find_all_decls_in_stmt (stmt: Ast.stmt) : (string * (Ast.c_type * Ast.expr option)) list =
     match stmt with
     | Decl (typ, name, _) -> [(name, (typ, None))]
     | ArrayDecl (typ, name, size) -> [(name, (typ, Some size))]
@@ -557,31 +582,27 @@ let ends_with ~suffix s =
     (* Gather all types of parameters and local variables *)
     let all_decls = find_all_decls_in_stmt fdef.body in
     List.iter (fun (typ, name) -> Hashtbl.add ctx.var_types name typ) fdef.params;
-    List.iter (fun (name, (typ, size_opt)) ->
-      let final_type = match size_opt with None -> typ | Some _ -> typ ^ "[]" in
-      Hashtbl.add ctx.var_types name final_type
-    ) all_decls;
+    List.iter (fun (name, (typ, _)) -> Hashtbl.add ctx.var_types name typ) all_decls;
 
     (* Process parameters *)
     let param_regs = List.map (fun (param_type, name) ->
         let param_val_reg = new_reg ctx in (* This will hold the incoming value *)
         Hashtbl.add ctx.reg_types param_val_reg param_type;
-        let ptr_reg = add_instr ctx (D_Alloca param_type) (param_type ^ "*") in
+        let ptr_reg = add_instr ctx (D_Alloca (c_type_to_ll_string param_type)) (TPtr param_type) in
         add_side_effect ctx (S_Store (O_Reg ptr_reg, O_Reg param_val_reg));
         Hashtbl.add ctx.var_map name ptr_reg;
         param_val_reg
       ) fdef.params
     in
 
-     (* Allocate space for all local variables *)
+    (* Allocate space for all local variables *)
     List.iter (fun (name, (typ, size_opt)) ->
       if not (Hashtbl.mem ctx.var_map name) then
         let ptr_reg = match size_opt with
-          | None ->
-              add_instr ctx (D_Alloca typ) (typ ^ "*")
+          | None -> add_instr ctx (D_Alloca (c_type_to_ll_string typ)) (TPtr typ)
           | Some size_expr ->
-              let (size_op, _) = convert_expr ctx size_expr in
-              add_instr ctx (D_ArrayAlloca (typ, size_op)) (typ ^ "*")
+              let (size_op, _) = convert_expr ctx size_expr in (* Array address has type TPtr(elem_type) *)
+              add_instr ctx (D_ArrayAlloca (c_type_to_ll_string typ, size_op)) (TPtr typ)
         in
         Hashtbl.add ctx.var_map name ptr_reg) all_decls;
 
@@ -592,7 +613,10 @@ let ends_with ~suffix s =
        flow off the end without a return, which is undefined behavior.
        We add a default return to make the IR well-formed. *)
     if not ctx.is_sealed then begin
-       seal_block ctx (T_Ret (O_Cst 0))
+       if fdef.ret_type = TVoid then
+         seal_block ctx (T_Ret (O_CstI 0)) (* Dummy for void, LLVM codegen will handle it *)
+       else
+         seal_block ctx (T_Ret (O_CstI 0)) (* Default return 0 for non-void *)
     end;
 
     {
@@ -603,6 +627,9 @@ let ends_with ~suffix s =
     }
 
   let convert_program (prog: Ast.program) : Ssa.program =
+    (* First pass: collect all function signatures *)
+    Hashtbl.clear func_return_types;
+    List.iter (fun fdef -> Hashtbl.add func_return_types fdef.name fdef) prog;
     List.map convert_func prog
 end
 
@@ -610,11 +637,18 @@ end
 module Ssa_printer = struct
   open Ssa
 
+  let rec string_of_c_type (t: Ast.c_type) : string =
+    match t with
+    | TVoid -> "void" | TChar -> "char" | TInt -> "int"
+    | TFloat -> "float" | TDouble -> "double"
+    | TPtr p -> (string_of_c_type p) ^ "*"
+
   let string_of_reg (R i) = "%r" ^ string_of_int i
   let string_of_bbid (L i) = "L" ^ string_of_int i
   let string_of_operand = function
-    | O_Cst i -> string_of_int i
-    | O_Reg r -> string_of_reg r 
+    | O_CstI i -> string_of_int i
+    | O_CstF f -> string_of_float f
+    | O_Reg r -> string_of_reg r
     | O_Global s -> "@" ^ s
 
   let string_of_binop = function
@@ -629,6 +663,8 @@ module Ssa_printer = struct
     | D_Phi phis -> "phi " ^ (String.concat ", " (List.map (fun (op, bbid) -> Printf.sprintf "[ %s, %s ]" (string_of_operand op) (string_of_bbid bbid)) phis))
     | D_Alloca typ -> Printf.sprintf "alloca %s" typ
     | D_ArrayAlloca (typ, size) -> Printf.sprintf "alloca %s, %s" typ (string_of_operand size)
+    | D_SIToFP op -> Printf.sprintf "sitofp %s" (string_of_operand op)
+    | D_FPToSI op -> Printf.sprintf "fptosi %s" (string_of_operand op)
     | D_GetElementPtr (base, index) -> Printf.sprintf "getelementptr %s, %s" (string_of_operand base) (string_of_operand index)
     | D_Load op -> Printf.sprintf "load %s" (string_of_operand op)
 
@@ -657,7 +693,10 @@ module Ssa_printer = struct
   let string_of_func_def f =
     let params_str = String.concat ", " (List.map string_of_reg f.params) in
     let blocks_str = String.concat "\n\n" (List.map string_of_basic_block f.blocks) in
-    Printf.sprintf "define @%s(%s) {\n%s\n}" f.name params_str blocks_str
+    let type_annots = Hashtbl.fold (fun r t acc ->
+        Printf.sprintf "; %s : %s" (string_of_reg r) (string_of_c_type t) :: acc
+      ) f.reg_types [] in
+    Printf.sprintf "define @%s(%s) {\n%s\n\n%s\n}" f.name params_str (String.concat "\n" (List.rev type_annots)) blocks_str
 
   let string_of_program prog =
     String.concat "\n\n" (List.map string_of_func_def prog)

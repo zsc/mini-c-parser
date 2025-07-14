@@ -1,5 +1,15 @@
 (* file ast.ml *)
 (* 操作符类型 *)
+
+(* C 类型系统 *)
+type c_type =
+  | TVoid
+  | TChar
+  | TInt
+  | TFloat
+  | TDouble
+  | TPtr of c_type
+
 type binop =
   | Add | Sub | Mul | Div | Mod
   | Le  (* Less than or equal <= *)
@@ -12,7 +22,8 @@ type binop =
 
 (* 表达式类型 *)
 type expr =
-  | Cst of int                      (* 常量: e.g., 1, 42 *)
+  | CstI of int                     (* 整型常量: e.g., 1, 42 *)
+  | CstF of float                   (* 浮点型常量: e.g., 3.14 *)
   | Id of string                    (* 标识符/变量: e.g., n *)
   | BinOp of binop * expr * expr    (* 二元运算: e.g., n * fac(n-1) *)
   | Call of string * expr list      (* 函数调用: e.g., fac(4) *)
@@ -27,16 +38,16 @@ type stmt =
   | While of expr * stmt            (* while 循环: while (cond) { body } *)
   | If of expr * stmt * stmt option (* if (cond) { then } else { else } *)
   | Block of stmt list              (* 代码块: { stmt1; stmt2; ... } *)
-  | Decl of string * string * expr option (* 变量声明: e.g., int x; int x = 5; *)
-  | ArrayDecl of string * string * expr (* 数组声明: e.g., int arr[10]; *)
+  | Decl of c_type * string * expr option (* 变量声明: e.g., int x; int x = 5; *)
+  | ArrayDecl of c_type * string * expr (* 数组声明: e.g., int arr[10]; *)
   | Assign of expr * expr           (* 赋值语句: e.g., x = 5; arr[0] = 10; *)
   | ExprStmt of expr                (* 表达式作为语句: e.g., func(); *)
 
 (* 顶层定义 (目前只有函数) *)
 type top_level_def = {
-  ret_type : string;                    (* 返回类型, e.g., "int" *)
+  ret_type : c_type;                    (* 返回类型 *)
   name     : string;                    (* 函数名, e.g., "fac" *)
-  params   : (string * string) list;    (* 参数列表 (类型, 名称), e.g., [("int", "n")] *)
+  params   : (c_type * string) list;    (* 参数列表 (类型, 名称) *)
   body     : stmt;                      (* 函数体, 是一个 Block *)
 }
 

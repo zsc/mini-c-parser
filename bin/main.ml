@@ -22,21 +22,24 @@ open Ssa
 (* Tokenizer (Lexer) *)
 
 type token =
-  | T_Int | T_Return | T_If | T_Else | T_While | T_For | T_Do
-  | T_Id of string | T_Num of int
+  | T_Int | T_Char | T_Float | T_Double | T_Void
+  | T_Return | T_If | T_Else | T_While | T_For | T_Do
+  | T_Id of string | T_Num of int | T_FNum of float
   | T_Plus | T_Minus | T_Star | T_Slash | T_Percent
   | T_Le | T_Eq | T_Ne | T_Lt | T_Gt | T_Ge
   | T_Lparen | T_Rparen | T_Assign | T_Lbrace | T_Rbrace | T_Lbracket | T_Rbracket | T_Ampersand
   | T_Pipe | T_Caret | T_Comma | T_Semicolon | T_Eof
 
 let keyword_map = [
-  ("int", T_Int); ("return", T_Return); ("if", T_If); ("else", T_Else);
+  ("int", T_Int); ("char", T_Char); ("float", T_Float); ("double", T_Double); ("void", T_Void);
+  ("return", T_Return); ("if", T_If); ("else", T_Else);
   ("while", T_While); ("for", T_For); ("do", T_Do)
 ]
 
 let token_specs = [
   (Str.regexp "[ \t\n\r]+", fun _ -> None); (Str.regexp "//[^\n]*", fun _ -> None); (Str.regexp "/\\*.*?\\*/", fun _ -> None);
   (Str.regexp "[a-zA-Z_][a-zA-Z0-9_]*", fun s -> try Some (List.assoc s keyword_map) with Not_found -> Some (T_Id s));
+  (Str.regexp "[0-9]+\\.[0-9]*\\([eE][-+]?[0-9]+\\)?", fun s -> Some (T_FNum (float_of_string s)));
   (Str.regexp "[0-9]+", fun s -> Some (T_Num (int_of_string s)));
   (Str.regexp "<=", fun _ -> Some T_Le); (Str.regexp "==", fun _ -> Some T_Eq); (Str.regexp "!=", fun _ -> Some T_Ne);
   (Str.regexp ">=", fun _ -> Some T_Ge); (Str.regexp "<", fun _ -> Some T_Lt); (Str.regexp ">", fun _ -> Some T_Gt);
@@ -73,8 +76,9 @@ exception Parser_error of string
 let fail_parse msg = raise (Parser_error msg)
 
 let string_of_token = function
-  | T_Int -> "T_Int" | T_Return -> "T_Return" | T_If -> "T_If" | T_Else -> "T_Else" | T_While -> "T_While" | T_For -> "T_For" | T_Do -> "T_Do"
-  | T_Id s -> Printf.sprintf "T_Id(%s)" s | T_Num n -> Printf.sprintf "T_Num(%d)" n
+  | T_Int -> "T_Int" | T_Char -> "T_Char" | T_Float -> "T_Float" | T_Double -> "T_Double" | T_Void -> "T_Void"
+  | T_Return -> "T_Return" | T_If -> "T_If" | T_Else -> "T_Else" | T_While -> "T_While" | T_For -> "T_For" | T_Do -> "T_Do"
+  | T_Id s -> Printf.sprintf "T_Id(%s)" s | T_Num n -> Printf.sprintf "T_Num(%d)" n | T_FNum f -> Printf.sprintf "T_FNum(%f)" f
   | T_Plus -> "T_Plus" | T_Minus -> "T_Minus" | T_Star -> "T_Star" | T_Slash -> "T_Slash" | T_Percent -> "T_Percent"
   | T_Le -> "T_Le" | T_Eq -> "T_Eq" | T_Ne -> "T_Ne" | T_Lt -> "T_Lt" | T_Gt -> "T_Gt" | T_Ge -> "T_Ge"
   | T_Lparen -> "T_Lparen" | T_Rparen -> "T_Rparen" | T_Assign -> "T_Assign"
@@ -97,29 +101,35 @@ let rec parse_program tokens : program * token list =
       (def :: defs, final_tokens)
 
 and parse_top_level_def tokens =
-  let rest1 = match tokens with T_Int :: r -> r | _ -> fail_parse "Expected 'int' as return type" in
+  let (ret_type, rest1) = parse_c_type tokens in
   let name, rest2 = match rest1 with T_Id s :: rest -> s, rest | _ -> fail_parse "Expected function name" in
   let rest3 = expect T_Lparen rest2 in
   let params, rest4 = parse_params rest3 in
   let rest5 = expect T_Rparen rest4 in
   let body, rest6 = parse_stmt rest5 in
-  ({ ret_type = "int"; name; params; body }, rest6)
+  ({ ret_type; name; params; body }, rest6)
 
-and parse_type_name tokens = match tokens with
-  | T_Int :: rest ->
-      let rec parse_pointers base_type toks =
-        match toks with
-        | T_Star :: r -> parse_pointers (base_type ^ "*") r
-        | _ -> (base_type, toks)
-      in
-      parse_pointers "int" rest
-  | _ -> fail_parse "Expected 'int' as base type"
+and parse_c_type tokens =
+  let base_type, rest = match tokens with
+    | T_Void   :: r -> (TVoid, r)
+    | T_Char   :: r -> (TChar, r)
+    | T_Int    :: r -> (TInt, r)
+    | T_Float  :: r -> (TFloat, r)
+    | T_Double :: r -> (TDouble, r)
+    | _ -> fail_parse "Expected a type keyword (int, char, void, etc.)"
+  in
+  let rec parse_pointers t toks =
+    match toks with
+    | T_Star :: r -> parse_pointers (TPtr t) r
+    | _ -> (t, toks)
+  in
+  parse_pointers base_type rest
 
 and parse_params tokens = match tokens with
   | T_Rparen :: _ -> ([], tokens)
   | _ ->
       let rec loop acc tokens =
-        let (param_type, rest1) = parse_type_name tokens in
+        let (param_type, rest1) = parse_c_type tokens in
         let name, rest2 = match rest1 with T_Id s :: rest -> s, rest | _ -> fail_parse "Expected parameter name" in
         let new_acc = acc @ [(param_type, name)] in
         match rest2 with T_Comma :: rest' -> loop new_acc rest' | _ -> (new_acc, rest2)
@@ -194,8 +204,8 @@ and parse_stmt tokens = match tokens with
         | T_Rbrace :: rest' -> (Block (List.rev acc), rest')
         | _ -> let (stmt, t') = parse_stmt t in parse_stmts (stmt :: acc) t'
       in parse_stmts [] rest
-  | T_Int :: _ ->
-      let (decl_type, rest_type) = parse_type_name tokens in
+  | T_Int :: _ | T_Char :: _ | T_Float :: _ | T_Double :: _ | T_Void :: _ ->
+      let (decl_type, rest_type) = parse_c_type tokens in
       let name, rest_name = match rest_type with T_Id s :: r -> s, r | _ -> fail_parse "Expected identifier in declaration" in
       (match rest_name with
        | T_Lbracket :: r ->
@@ -266,7 +276,7 @@ and parse_multiplicative_expr tokens =
 and parse_unary_expr tokens = match tokens with
   | T_Minus :: r -> let (e, r') = parse_unary_expr r in (BinOp (Sub, Cst 0, e), r')
   | T_Plus :: r -> parse_unary_expr r
-  | T_Ampersand :: r -> let (e, r') = parse_unary_expr r in (AddrOf e, r')
+  | T_Ampersand :: r -> let (e, r') = parse_unary_expr r in (AddrOf e, r') (* Must be parse_unary to handle &*p *)
   | T_Star :: r -> let (e, r') = parse_unary_expr r in (Deref e, r')
   | _ -> parse_postfix_expr tokens
 and parse_postfix_expr tokens =
@@ -274,6 +284,7 @@ and parse_postfix_expr tokens =
   let rec loop base_expr tokens =
     match tokens with
     | T_Lparen :: _ -> (* Function call *)
+        (* Note: this grammar doesn't support pointer-to-function calls like ( *p)(); only direct calls f(). *)
         let func_name = match base_expr with Id s -> s | _ -> fail_parse "Function name must be an identifier" in
         let rest1 = expect T_Lparen tokens in
         let (args, rest2) = parse_args rest1 in
@@ -285,8 +296,8 @@ and parse_postfix_expr tokens =
         loop (ArrayAccess (base_expr, index_expr)) rest''
     | _ -> (base_expr, tokens)
   in loop base rest
-and parse_primary_expr tokens = match tokens with
-  | T_Num n :: rest -> (Cst n, rest)
+and parse_primary_expr tokens = match tokens with | T_Num n :: rest -> (CstI n, rest)
+  | T_FNum f :: rest -> (CstF f, rest)
   | T_Id s :: rest -> (Id s, rest)
   | T_Lparen :: rest ->
       let (e, rest') = parse_expr rest in
@@ -316,109 +327,140 @@ let parse_from_string str =
 (* Code Generation (from SSA to LLVM IR) *)
 module Codegen = struct
   open Ssa
+  open Ast
   open Ast_to_ssa
 
   let string_of_ssa_reg (R i) = "%r" ^ string_of_int i
   let string_of_ssa_bbid (L i) = "L" ^ string_of_int i
 
-  let rec ll_type_of_ssa_type (typ: string) : string =
-    if typ = "int" then "i32"
-    else
-      let len = String.length typ in
-      if len > 0 && typ.[len - 1] = '*' then
-        (ll_type_of_ssa_type (get_pointee_type typ)) ^ "*"
-      else failwith ("Unknown SSA type for codegen: " ^ typ)
+  let rec ll_type_of_c_type (typ: c_type) : string =
+    match typ with
+    | TVoid -> "void"
+    | TChar -> "i8"
+    | TInt -> "i32"
+    | TFloat -> "float"
+    | TDouble -> "double"
+    | TPtr t -> (ll_type_of_c_type t) ^ "*"
 
   let string_of_ssa_operand (op: operand) : string =
     match op with
-    | O_Cst i -> string_of_int i
+    | O_CstI i -> string_of_int i
+    | O_CstF f ->
+        let s = Printf.sprintf "%f" f in
+        if not (String.contains s '.') then s ^ ".0" else s
     | O_Reg r -> string_of_ssa_reg r
     | O_Global s -> "@" ^ s
 
-  let ll_binop = function
-    | Add -> "add nsw"
-    | Sub -> "sub nsw"
-    | Mul -> "mul nsw"
-    | Div -> "sdiv"
-    | Mod -> "srem"
-    | BitAnd -> "and"
-    | BitOr -> "or"
-    | BitXor -> "xor"
-    | Lt  -> "icmp slt"
-    | Le  -> "icmp sle"
-    | Gt  -> "icmp sgt"
-    | Ge  -> "icmp sge"
-    | Eq  -> "icmp eq"
-    | Ne  -> "icmp ne"
+  let ll_op_for_type (is_float: bool) (op: Ast.binop) =
+    match op, is_float with
+    | Add, false -> "add nsw" | Add, true -> "fadd"
+    | Sub, false -> "sub nsw" | Sub, true -> "fsub"
+    | Mul, false -> "mul nsw" | Mul, true -> "fmul"
+    | Div, false -> "sdiv"    | Div, true -> "fdiv"
+    | Mod, false -> "srem"    | Mod, true -> "frem"
+    | Lt,  false -> "icmp slt" | Lt,  true -> "fcmp olt"
+    | Le,  false -> "icmp sle" | Le,  true -> "fcmp ole"
+    | Gt,  false -> "icmp sgt" | Gt,  true -> "fcmp ogt"
+    | Ge,  false -> "icmp sge" | Ge,  true -> "fcmp oge"
+    | Eq,  false -> "icmp eq"  | Eq,  true -> "fcmp oeq"
+    | Ne,  false -> "icmp ne"  | Ne,  true -> "fcmp one"
+    | BitAnd, false -> "and"
+    | BitOr, false -> "or"
+    | BitXor, false -> "xor"
+    | _, true -> failwith "Unsupported float operation"
 
-  let codegen_instr (reg_types: (reg, string) Hashtbl.t) (instr: instruction) : string list =
+  let codegen_instr (func_reg_types: (reg, c_type) Hashtbl.t) (instr: instruction) : string list =
     let dest_reg = string_of_ssa_reg instr.reg in
+    let get_op_type op = match op with
+      | O_Reg r  -> Hashtbl.find func_reg_types r
+      | O_CstI _ -> TInt
+      | O_CstF _ -> TDouble
+      | O_Global _ -> failwith "Cannot get type of global"
+    in
     match instr.def with
     | D_BinOp (op, o1, o2) ->
-        let op_str = ll_binop op in
+        let op_type = get_op_type o1 in
+        let is_float = match op_type with TFloat | TDouble -> true | _ -> false in
+        let op_str = ll_op_for_type is_float op in
         let s_op1 = string_of_ssa_operand o1 in
         let s_op2 = string_of_ssa_operand o2 in
+        let ll_type = ll_type_of_c_type op_type in
         let is_comparison = match op with Lt|Le|Gt|Ge|Eq|Ne -> true | _ -> false in
         if is_comparison then
           let i1_res = dest_reg ^ ".i1" in
-          let cmp_instr = Printf.sprintf "  %s = %s i32 %s, %s" i1_res op_str s_op1 s_op2 in
-          let zext_instr = Printf.sprintf "  %s = zext i1 %s to i32" dest_reg i1_res in
+          let cmp_instr = Printf.sprintf "  %s = %s %s %s, %s" i1_res op_str ll_type s_op1 s_op2 in
+          let zext_instr = Printf.sprintf "  %s = zext i1 %s to i32" dest_reg i1_res in (* Result of comparison is always i32 0 or 1 *)
           [cmp_instr; zext_instr]
         else
-          [Printf.sprintf "  %s = %s i32 %s, %s" dest_reg op_str s_op1 s_op2]
+          [Printf.sprintf "  %s = %s %s %s, %s" dest_reg op_str ll_type s_op1 s_op2]
     | D_Call (name, args) ->
         let get_arg_with_type op =
           let s_op = string_of_ssa_operand op in
-          let ssa_type = match op with
-            | O_Cst _ -> "int" (* Constants are always int in our language *)
-            | O_Reg r ->
-                (try Hashtbl.find reg_types r
-                 with Not_found -> failwith ("codegen: could not find type for register " ^ string_of_ssa_reg r))
-            | O_Global _ -> failwith "codegen: cannot use global as function argument"
-          in
-          (ll_type_of_ssa_type ssa_type) ^ " " ^ s_op
+          let c_type = get_op_type op in
+          (ll_type_of_c_type c_type) ^ " " ^ s_op
         in
         let arg_strs = List.map get_arg_with_type args in
-        (* The compiler currently assumes all functions return int (i32). *)
-        [Printf.sprintf "  %s = call i32 @%s(%s)" dest_reg name (String.concat ", " arg_strs)]
+        let ret_type = Hashtbl.find func_reg_types instr.reg in
+        let ll_ret_type = ll_type_of_c_type ret_type in
+        if ret_type = TVoid then
+          [Printf.sprintf "  call void @%s(%s)" name (String.concat ", " arg_strs)]
+        else
+          [Printf.sprintf "  %s = call %s @%s(%s)" dest_reg ll_ret_type name (String.concat ", " arg_strs)]
     | D_Phi _ -> failwith "LLVM Codegen: Phi nodes not supported in this simplified compiler"
     | D_Alloca typ ->
-        let ll_type = ll_type_of_ssa_type typ in
-        [Printf.sprintf "  %s = alloca %s, align 4" dest_reg ll_type]
+        [Printf.sprintf "  %s = alloca %s, align 4" dest_reg typ] (* Type is already stringified to LLVM *)
     | D_ArrayAlloca (typ, size_op) ->
-        let ll_type = ll_type_of_ssa_type typ in
         let s_size = string_of_ssa_operand size_op in
-        [Printf.sprintf "  %s = alloca %s, i32 %s, align 4" dest_reg ll_type s_size]
+        [Printf.sprintf "  %s = alloca %s, i32 %s, align 4" dest_reg typ s_size]
+    | D_SIToFP op ->
+        let src_type = get_op_type op in
+        let dest_type = Hashtbl.find func_reg_types instr.reg in
+        let ll_src_type = ll_type_of_c_type src_type in
+        let ll_dest_type = ll_type_of_c_type dest_type in
+        [Printf.sprintf "  %s = sitofp %s %s to %s" dest_reg ll_src_type (string_of_ssa_operand op) ll_dest_type]
+    | D_FPToSI op ->
+        let src_type = get_op_type op in
+        let dest_type = Hashtbl.find func_reg_types instr.reg in
+        let ll_src_type = ll_type_of_c_type src_type in
+        let ll_dest_type = ll_type_of_c_type dest_type in
+        [Printf.sprintf "  %s = fptosi %s %s to %s" dest_reg ll_src_type (string_of_ssa_operand op) ll_dest_type]
     | D_GetElementPtr (base_op, index_op) ->
-        let ptr_type = Hashtbl.find reg_types (match base_op with O_Reg r -> r | _ -> failwith "GEP base must be a register") in
-        let pointee_type_str = get_pointee_type ptr_type in
-        let ll_pointee_type = ll_type_of_ssa_type pointee_type_str in
-        let ll_ptr_type = ll_type_of_ssa_type ptr_type in
+        let ptr_c_type = get_op_type base_op in
+        let pointee_c_type = get_pointee_type ptr_c_type in
+        let ll_pointee_type = ll_type_of_c_type pointee_c_type in
+        let ll_ptr_type = ll_type_of_c_type ptr_c_type in
         let s_base = string_of_ssa_operand base_op in
         let s_index = string_of_ssa_operand index_op in
         [Printf.sprintf "  %s = getelementptr inbounds %s, %s %s, i32 %s" dest_reg ll_pointee_type ll_ptr_type s_base s_index]
     | D_Load addr_op ->
-        let res_type_str = Hashtbl.find reg_types instr.reg in
-        let ll_res_type = ll_type_of_ssa_type res_type_str in
+        let res_c_type = Hashtbl.find func_reg_types instr.reg in
+        let ll_res_type = ll_type_of_c_type res_c_type in
         let ll_ptr_type = ll_res_type ^ "*" in
         let s_addr = string_of_ssa_operand addr_op in
         [Printf.sprintf "  %s = load %s, %s %s, align 4" dest_reg ll_res_type ll_ptr_type s_addr]
 
-  let codegen_side_effect (reg_types: (reg, string) Hashtbl.t) (sei: side_effect_instr) : string =
+  let codegen_side_effect (func_reg_types: (reg, c_type) Hashtbl.t) (sei: side_effect_instr) : string =
+    let get_op_type op = match op with
+      | O_Reg r  -> Hashtbl.find func_reg_types r
+      | O_CstI _ -> TInt
+      | O_CstF _ -> TDouble
+      | O_Global _ -> failwith "Cannot get type of global"
+    in
     match sei with
     | S_Store (addr_op, val_op) ->
         let s_addr = string_of_ssa_operand addr_op in
         let s_val = string_of_ssa_operand val_op in
-        let val_type_str = match val_op with
-          | O_Reg r -> Hashtbl.find reg_types r
-          | O_Cst _ -> "int"
-          | O_Global _ -> failwith "Cannot store a global function name" in
-        let ll_val_type = ll_type_of_ssa_type val_type_str in
+        let val_c_type = get_op_type val_op in
+        let ll_val_type = ll_type_of_c_type val_c_type in
         Printf.sprintf "  store %s %s, %s* %s, align 4" ll_val_type s_val ll_val_type s_addr
 
-  let codegen_terminator (term: terminator) : string list =
+  let codegen_terminator (func_ret_type: c_type) (term: terminator) : string list =
     match term with
-    | T_Ret op -> [Printf.sprintf "  ret i32 %s" (string_of_ssa_operand op)]
+    | T_Ret op ->
+        if func_ret_type = TVoid then ["  ret void"]
+        else
+          let ll_ret_type = ll_type_of_c_type func_ret_type in
+          [Printf.sprintf "  ret %s %s" ll_ret_type (string_of_ssa_operand op)]
     | T_Br bbid -> [Printf.sprintf "  br label %%%s" (string_of_ssa_bbid bbid)]
     | T_CBr (cond_op, ltrue, lfalse) ->
         let s_cond = string_of_ssa_operand cond_op in
@@ -428,19 +470,20 @@ module Codegen = struct
         let br_instr = Printf.sprintf "  br i1 %s, label %%%s, label %%%s" i1_res_for_br (string_of_ssa_bbid ltrue) (string_of_ssa_bbid lfalse) in
         [cmp_instr; br_instr]
 
-  let codegen_bb (reg_types: (reg, string) Hashtbl.t) (bb: basic_block) : string list =
+  let codegen_bb (f: func_def) (bb: basic_block) : string list =
     let label = (string_of_ssa_bbid bb.id) ^ ":" in
     let ops_code = List.concat_map (function
-      | I_Instr i -> codegen_instr reg_types i
-      | I_Side_Effect s -> [codegen_side_effect reg_types s]
+      | I_Instr i -> codegen_instr f.reg_types i
+      | I_Side_Effect s -> [codegen_side_effect f.reg_types s]
       ) bb.ops in
-    let term = codegen_terminator bb.term in
+    let term = codegen_terminator f.ret_type bb.term in
     [label] @ ops_code @ term
 
   let codegen_func (f: func_def) : string =
-    let param_strs = List.map (fun r -> (ll_type_of_ssa_type (Hashtbl.find f.reg_types r)) ^ " " ^ string_of_ssa_reg r) f.params in
-    let signature = Printf.sprintf "define i32 @%s(%s) {" f.name (String.concat ", " param_strs) in
-    let body_lines = List.concat_map (codegen_bb f.reg_types) f.blocks in
+    let func_info = Hashtbl.find Ast_to_ssa.func_return_types f.name in
+    let param_strs = List.map (fun r -> (ll_type_of_c_type (Hashtbl.find f.reg_types r)) ^ " " ^ string_of_ssa_reg r) f.params in
+    let signature = Printf.sprintf "define %s @%s(%s) {" (ll_type_of_c_type func_info.ret_type) f.name (String.concat ", " param_strs) in
+    let body_lines = List.concat_map (codegen_bb {f with ret_type = func_info.ret_type}) f.blocks in
     String.concat "\n" ([signature] @ body_lines @ ["}"])
 
   let codegen_program (prog: Ssa.program) : (string, string) result =
@@ -453,8 +496,15 @@ module Codegen = struct
 end
 
 (* AST Pretty Printer (for debugging) *)
+let rec string_of_c_type = function
+  | TVoid -> "void" | TChar -> "char" | TInt -> "int"
+  | TFloat -> "float" | TDouble -> "double"
+  | TPtr t -> (string_of_c_type t) ^ "*"
+
 let rec string_of_expr = function
-  | Cst n -> string_of_int n | Id s -> s
+  | CstI n -> string_of_int n
+  | CstF f -> string_of_float f
+  | Id s -> s
   | BinOp (op, e1, e2) ->
       let op_str = match op with Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%"
         | Le -> "<=" | Eq -> "==" | Ne -> "!=" | Lt -> "<" | Gt -> ">" | Ge -> ">="
@@ -474,14 +524,14 @@ let rec string_of_stmt indent = function
       indent ^ "If (" ^ (string_of_expr c) ^ ")\n" ^ (string_of_stmt (indent ^ "  ") t) ^ else_str
   | Block stmts -> indent ^ "{\n" ^ (String.concat "\n" (List.map (string_of_stmt (indent ^ "  ")) stmts)) ^ "\n" ^ indent ^ "}"
   | Decl (t, n, i_opt) -> let init_str = match i_opt with Some e -> " = " ^ (string_of_expr e) | None -> "" in
-      Printf.sprintf "%sDecl %s %s%s;" indent t n init_str
-  | ArrayDecl (t, n, s) -> Printf.sprintf "%sArrayDecl %s %s[%s];" indent t n (string_of_expr s)
+      Printf.sprintf "%sDecl %s %s%s;" indent (string_of_c_type t) n init_str
+  | ArrayDecl (t, n, s) -> Printf.sprintf "%sArrayDecl %s %s[%s];" indent (string_of_c_type t) n (string_of_expr s)
   | Assign (l, r) -> Printf.sprintf "%sAssign %s = %s;" indent (string_of_expr l) (string_of_expr r)
   | ExprStmt e -> Printf.sprintf "%sExprStmt %s;" indent (string_of_expr e)
 
 let string_of_def (d: top_level_def) =
-  let params_str = String.concat ", " (List.map (fun (t, n) -> t ^ " " ^ n) d.params) in
-  Printf.sprintf "Function %s %s(%s)\n%s" d.ret_type d.name params_str (string_of_stmt "" d.body)
+  let params_str = String.concat ", " (List.map (fun (t, n) -> (string_of_c_type t) ^ " " ^ n) d.params) in
+  Printf.sprintf "Function %s %s(%s)\n%s" (string_of_c_type d.ret_type) d.name params_str (string_of_stmt "" d.body)
 
 let string_of_program (p: program) = String.concat "\n\n" (List.map string_of_def p)
 
@@ -567,18 +617,18 @@ let () =
   let is_test = List.mem "--test" args in
   let is_verbose = List.mem "--verbose" args in
 
+  (* Simple test case with a float *)
   let input_code =
     if is_test then "
 int
 main()
 {
-    int x;
-
-    x = 50;
-    do
-        x = x - 1;
-    while(x);
-    return x;
+    double x;
+    x = 1.5;
+    if (x > 1.0) {
+      return 1;
+    }
+    return 0;
 }
       "
     else
