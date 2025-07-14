@@ -22,16 +22,17 @@ open Ssa
 (* Tokenizer (Lexer) *)
 
 type token =
-  | T_Int | T_Char | T_Float | T_Double | T_Void
+  | T_Int | T_Char | T_Float | T_Double | T_Void | T_Struct | T_Union | T_Enum
   | T_Return | T_If | T_Else | T_While | T_For | T_Do
   | T_Id of string | T_Num of int | T_FNum of float | T_String of string | T_Char_Lit of char
   | T_Plus | T_Minus | T_Star | T_Slash | T_Percent
   | T_Le | T_Eq | T_Ne | T_Lt | T_Gt | T_Ge
   | T_Lparen | T_Rparen | T_Assign | T_Lbrace | T_Rbrace | T_Lbracket | T_Rbracket | T_Ampersand
-  | T_Pipe | T_Caret | T_Comma | T_Semicolon | T_Eof
+  | T_Pipe | T_Caret | T_Comma | T_Semicolon | T_Dot | T_Arrow | T_Eof
 
 let keyword_map = [
   ("int", T_Int); ("char", T_Char); ("float", T_Float); ("double", T_Double); ("void", T_Void);
+  ("struct", T_Struct); ("union", T_Union); ("enum", T_Enum);
   ("return", T_Return); ("if", T_If); ("else", T_Else);
   ("while", T_While); ("for", T_For); ("do", T_Do)
 ]
@@ -99,12 +100,14 @@ let token_specs = [
   (Str.regexp "<=", fun _ -> Some T_Le); (Str.regexp "==", fun _ -> Some T_Eq); (Str.regexp "!=", fun _ -> Some T_Ne);
   (Str.regexp ">=", fun _ -> Some T_Ge); (Str.regexp "<", fun _ -> Some T_Lt); (Str.regexp ">", fun _ -> Some T_Gt);
   (Str.regexp "[+]", fun _ -> Some T_Plus); (Str.regexp "-", fun _ -> Some T_Minus); (Str.regexp "&", fun _ -> Some T_Ampersand); (Str.regexp "=", fun _ -> Some T_Assign);
+  (Str.regexp "->", fun _ -> Some T_Arrow);
   (Str.regexp "[*]", fun _ -> Some T_Star); (Str.regexp "/", fun _ -> Some T_Slash); (Str.regexp "[%]", fun _ -> Some T_Percent);
   (Str.regexp "[|]", fun _ -> Some T_Pipe); (Str.regexp "[\\^]", fun _ -> Some T_Caret);
   (Str.regexp "[(]", fun _ -> Some T_Lparen); (Str.regexp "[)]", fun _ -> Some T_Rparen);
   (Str.regexp "[{]", fun _ -> Some T_Lbrace); (Str.regexp "[}]", fun _ -> Some T_Rbrace);
   (Str.regexp "\\[", fun _ -> Some T_Lbracket); (Str.regexp "\\]", fun _ -> Some T_Rbracket);
   (Str.regexp ",", fun _ -> Some T_Comma); (Str.regexp ";", fun _ -> Some T_Semicolon);
+  (Str.regexp "\\.", fun _ -> Some T_Dot);
 ]
 
 let tokenize str =
@@ -131,14 +134,14 @@ exception Parser_error of string
 let fail_parse msg = raise (Parser_error msg)
 
 let string_of_token = function
-  | T_Int -> "T_Int" | T_Char -> "T_Char" | T_Float -> "T_Float" | T_Double -> "T_Double" | T_Void -> "T_Void"
+  | T_Int -> "T_Int" | T_Char -> "T_Char" | T_Float -> "T_Float" | T_Double -> "T_Double" | T_Void -> "T_Void" | T_Struct -> "T_Struct" | T_Union -> "T_Union" | T_Enum -> "T_Enum"
   | T_Return -> "T_Return" | T_If -> "T_If" | T_Else -> "T_Else" | T_While -> "T_While" | T_For -> "T_For" | T_Do -> "T_Do"
   | T_String s -> Printf.sprintf "T_String(\"%s\")" (String.escaped s) | T_Char_Lit c -> Printf.sprintf "T_Char_Lit('%c')" c
   | T_Id s -> Printf.sprintf "T_Id(%s)" s | T_Num n -> Printf.sprintf "T_Num(%d)" n | T_FNum f -> Printf.sprintf "T_FNum(%f)" f
   | T_Plus -> "T_Plus" | T_Minus -> "T_Minus" | T_Star -> "T_Star" | T_Slash -> "T_Slash" | T_Percent -> "T_Percent"
   | T_Le -> "T_Le" | T_Eq -> "T_Eq" | T_Ne -> "T_Ne" | T_Lt -> "T_Lt" | T_Gt -> "T_Gt" | T_Ge -> "T_Ge"
   | T_Lparen -> "T_Lparen" | T_Rparen -> "T_Rparen" | T_Assign -> "T_Assign"
-  | T_Lbrace -> "T_Lbrace" | T_Rbrace -> "T_Rbrace" | T_Lbracket -> "T_Lbracket" | T_Rbracket -> "T_Rbracket"
+  | T_Lbrace -> "T_Lbrace" | T_Rbrace -> "T_Rbrace" | T_Lbracket -> "T_Lbracket" | T_Rbracket -> "T_Rbracket" | T_Dot -> "T_Dot" | T_Arrow -> "T_Arrow"
   | T_Ampersand -> "T_Ampersand"
   | T_Pipe -> "T_Pipe" | T_Caret -> "T_Caret" | T_Comma -> "T_Comma" | T_Semicolon -> "T_Semicolon" | T_Eof -> "T_Eof"
 
@@ -157,6 +160,13 @@ let rec parse_program tokens : program * token list =
       (def :: defs, final_tokens)
 
 and parse_top_level_def tokens =
+  match tokens with
+  | T_Struct :: _ -> let (def, r) = parse_struct_union_def true tokens in (GStructDef def, r)
+  | T_Union :: _ -> let (def, r) = parse_struct_union_def false tokens in (GUnionDef def, r)
+  | T_Enum :: _ -> let (def, r) = parse_enum_def tokens in (GEnumDef def, r)
+  | _ -> parse_var_or_func_def tokens
+
+and parse_var_or_func_def tokens =
   let (base_type, rest1) = parse_c_type tokens in
   let name, rest2 = match rest1 with T_Id s :: rest -> s, rest | _ -> fail_parse "Expected identifier in top-level definition" in
   match rest2 with
@@ -186,6 +196,9 @@ and parse_c_type tokens =
     | T_Int    :: r -> (TInt, r)
     | T_Float  :: r -> (TFloat, r)
     | T_Double :: r -> (TDouble, r)
+    | T_Struct :: T_Id s :: r -> (TStruct s, r)
+    | T_Union :: T_Id s :: r -> (TUnion s, r)
+    | T_Enum :: T_Id s :: r -> (TEnum s, r)
     | _ -> fail_parse "Expected a type keyword (int, char, void, etc.)"
   in
   let rec parse_pointers t toks =
@@ -194,6 +207,48 @@ and parse_c_type tokens =
     | _ -> (t, toks)
   in
   parse_pointers base_type rest
+
+and parse_struct_union_def is_struct tokens =
+  let start_tok, rest0 = if is_struct then T_Struct, List.tl tokens else T_Union, List.tl tokens in
+  let name, rest1 = match rest0 with T_Id s :: r -> s, r | _ -> fail_parse ("Expected " ^ (if is_struct then "struct" else "union") ^ " name") in
+  let rest2 = expect T_Lbrace rest1 in
+  let rec parse_members acc toks =
+    match toks with
+    | T_Rbrace :: _ -> (List.rev acc, toks)
+    | _ ->
+        let (mem_type, r1) = parse_c_type toks in
+        let mem_name, r2 = match r1 with T_Id s :: r -> s,r | _ -> fail_parse "Expected member name" in
+        let r3 = expect T_Semicolon r2 in
+        parse_members ((mem_type, mem_name) :: acc) r3
+  in
+  let members, rest3 = parse_members [] rest2 in
+  let rest4 = expect T_Rbrace rest3 in
+  let rest_final = expect T_Semicolon rest4 in
+  if is_struct then ({ s_name = name; s_members = members }, rest_final)
+  else ({ u_name = name; u_members = members }, rest_final)
+
+and parse_enum_def tokens =
+  let rest0 = expect T_Enum tokens in
+  let name_opt, rest1 = match rest0 with T_Id s :: r -> (Some s, r) | _ -> (None, rest0) in
+  let rest2 = expect T_Lbrace rest1 in
+  let rec parse_members acc toks =
+    match toks with
+    | T_Rbrace :: _ -> (List.rev acc, toks)
+    | T_Id s :: r ->
+        let (val_opt, r') = match r with
+          | T_Assign :: r' -> let (e, r'') = parse_expr r' in (Some e, r'')
+          | _ -> (None, r)
+        in
+        let new_acc = (s, val_opt) :: acc in
+        (match r' with
+         | T_Comma :: r''' -> parse_members new_acc r'''
+         | _ -> (List.rev new_acc, r'))
+    | _ -> fail_parse "Malformed enum definition"
+  in
+  let members, rest3 = parse_members [] rest2 in
+  let rest4 = expect T_Rbrace rest3 in
+  let rest_final = expect T_Semicolon rest4 in
+  ({ e_name = name_opt; e_members = members }, rest_final)
 
 and parse_params tokens = match tokens with
   | T_Rparen :: _ -> ([], tokens)
@@ -276,7 +331,7 @@ and parse_stmt tokens = match tokens with
       in parse_stmts [] rest
   | T_Int :: _ | T_Char :: _ | T_Float :: _ | T_Double :: _ | T_Void :: _ ->
       let (decl_type, rest_type) = parse_c_type tokens in
-      let name, rest_name = match rest_type with T_Id s :: r -> s, r | _ -> fail_parse "Expected identifier in declaration" in
+      let name, rest_name = match rest_type with T_Id s :: r -> s, r | _ -> fail_parse ("Expected identifier in declaration, got " ^ (string_of_token (List.hd rest_type))) in
       (match rest_name with
        | T_Lbracket :: r ->
            let (size_expr, r') = parse_expr r in
@@ -298,6 +353,9 @@ and parse_stmt tokens = match tokens with
             (Assign(lhs_expr, rhs_expr), rest_final)
         | T_Semicolon :: rest_final -> (ExprStmt lhs_expr, rest_final)
         | _ -> fail_parse "Expected '=' or ';' after expression statement")
+  | T_Struct :: _ | T_Union :: _ | T_Enum :: _ ->
+      (* Local type definitions not supported, treat as variable declaration *)
+      parse_stmt (T_Int :: (List.tl tokens)) (* HACK: Re-parse as int for simplicity *)
 
 and parse_expr tokens = parse_assign_expr tokens
 and parse_assign_expr tokens = parse_bitwise_or_expr tokens
@@ -364,6 +422,10 @@ and parse_postfix_expr tokens =
         let (index_expr, rest') = parse_expr rest in
         let rest'' = expect T_Rbracket rest' in
         loop (ArrayAccess (base_expr, index_expr)) rest''
+    | T_Dot :: T_Id field :: rest -> (* Member access s.f *)
+        loop (MemberAccess (base_expr, field)) rest
+    | T_Arrow :: T_Id field :: rest -> (* Pointer member access p->f *)
+        loop (PtrMemberAccess (base_expr, field)) rest
     | _ -> (base_expr, tokens)
   in loop base rest
 and parse_primary_expr tokens = match tokens with
@@ -419,6 +481,9 @@ module Codegen = struct
     | TDouble -> "double"
     | TPtr t -> (ll_type_of_c_type t) ^ "*"
     | TArray (t, _) -> (ll_type_of_c_type t) ^ "*"
+    | TStruct s -> "%struct." ^ s
+    | TUnion u -> Ast_to_ssa.((Hashtbl.find union_env u).u_ll_type)
+    | TEnum _ -> "i32"
 
   let string_of_ssa_operand (op: operand) : string =
     match op with
@@ -497,7 +562,17 @@ module Codegen = struct
         let dest_type = Hashtbl.find func_reg_types instr.reg in
         let ll_src_type = ll_type_of_c_type src_type in
         let ll_dest_type = ll_type_of_c_type dest_type in
-        [Printf.sprintf "  %s = sitofp %s %s to %s" dest_reg ll_src_type (string_of_ssa_operand op) ll_dest_type]
+        [Printf.sprintf "  %s = fptosi %s %s to %s" dest_reg ll_src_type (string_of_ssa_operand op) ll_dest_type]
+    | D_GetElementPtr (base_op, index_ops) ->
+        let ptr_c_type = get_op_type base_op in
+        let pointee_c_type = get_pointee_type ptr_c_type in
+        let ll_pointee_type = ll_type_of_c_type pointee_c_type in
+        let ll_ptr_type = ll_type_of_c_type ptr_c_type in
+        let s_base = string_of_ssa_operand base_op in
+        let s_indices = List.map (fun op -> "i32 " ^ string_of_ssa_operand op) index_ops in
+        [Printf.sprintf "  %s = getelementptr inbounds %s, %s %s, %s" dest_reg ll_pointee_type ll_ptr_type s_base (String.concat ", " s_indices)]
+    | D_Bitcast op ->
+        [Printf.sprintf "  %s = bitcast %s %s to %s" dest_reg (ll_type_of_c_type (get_op_type op)) (string_of_ssa_operand op) (ll_type_of_c_type (Hashtbl.find func_reg_types instr.reg))]
     | D_FPToSI op ->
         let src_type = get_op_type op in
         let dest_type = Hashtbl.find func_reg_types instr.reg in
@@ -581,21 +656,34 @@ module Codegen = struct
           ) s;
           Buffer.contents buf
         in
-        let global_var_defs = List.map (function
-          | GVar (typ, name, init_opt) ->
-              let ll_type = ll_type_of_c_type typ in
-              let (linkage, init_str) = match init_opt with
-                | Some (CstI i) -> ("global", string_of_int i)
-                | Some (CstF f) -> ("global", string_of_float f) (* Simplified float for now *)
-                | _ -> ("common global", "0") (* Uninitialized or non-const init defaults to 0 *)
-              in
-              Printf.sprintf "@%s = %s %s %s, align 4" name linkage ll_type init_str
-          | GArray (typ, name, size_expr) ->
-              let ll_elem_type = ll_type_of_c_type typ in
-              let size = match size_expr with CstI n -> n | _ -> failwith "Codegen: Global array size must be a constant integer" in
-              Printf.sprintf "@%s = common global [%d x %s] zeroinitializer, align 16" name size ll_elem_type
-          | GFunc _ -> "" (* Handled separately *)
-          ) globals in
+
+        let type_defs =
+          let structs = Hashtbl.fold (fun name info acc ->
+            let member_types = info.s_members |> Hashtbl.to_seq_values |> List.of_seq |> List.sort (fun f1 f2 -> compare f1.f_index f2.f_index) |> List.map (fun f -> ll_type_of_c_type f.f_type) in
+            (Printf.sprintf "%%struct.%s = type { %s }" name (String.concat ", " member_types)) :: acc
+          ) Ast_to_ssa.struct_env [] in
+          let unions = Hashtbl.fold (fun name info acc ->
+            (Printf.sprintf "%%union.%s = type { %s }" name info.u_ll_type) :: acc
+          ) Ast_to_ssa.union_env [] in
+          structs @ unions
+        in
+
+        let global_var_defs = List.filter_map (function
+            | GVar (typ, name, init_opt) ->
+                let ll_type = ll_type_of_c_type typ in
+                let (linkage, init_str) = match init_opt with
+                  | Some (CstI i) -> ("global", string_of_int i)
+                  | Some (CstF f) -> ("global", string_of_float f)
+                  | _ -> ("common global", "0")
+                in
+                Some (Printf.sprintf "@%s = %s %s %s, align 4" name linkage ll_type init_str)
+            | GArray (typ, name, size_expr) ->
+                let ll_elem_type = ll_type_of_c_type typ in
+                let size = match size_expr with CstI n -> n | _ -> failwith "Codegen: Global array size must be a constant integer" in
+                Some (Printf.sprintf "@%s = common global [%d x %s] zeroinitializer, align 16" name size ll_elem_type)
+            | GFunc _ | GStructDef _ | GUnionDef _ | GEnumDef _ -> None
+          ) globals
+        in
 
         let string_lits =
           Hashtbl.fold (fun str_val label acc ->
@@ -605,9 +693,9 @@ module Codegen = struct
             def :: acc
           ) Ast_to_ssa.global_strings []
         in
-        let global_defs = global_var_defs @ string_lits in
+        let global_defs = type_defs @ global_var_defs @ string_lits in
         let func_defs = List.map codegen_func prog in
-        let full_module = String.concat "\n" (List.filter ((<>) "") global_defs) ^ "\n\n" ^ String.concat "\n\n" func_defs in
+        let full_module = String.concat "\n" global_defs ^ "\n\n" ^ String.concat "\n\n" func_defs in
         Ok full_module
     with
     | Failure msg -> Error ("Codegen failed: " ^ msg)
@@ -617,6 +705,7 @@ end
 let rec string_of_c_type = function
   | TVoid -> "void" | TChar -> "char" | TInt -> "int"
   | TFloat -> "float" | TDouble -> "double"
+  | TStruct s -> "struct " ^ s | TUnion u -> "union " ^ u | TEnum e -> "enum " ^ (match e with "" -> "?" | _ -> e)
   | TPtr t -> (string_of_c_type t) ^ "*"
   | TArray (t, n) -> Printf.sprintf "%s[%d]" (string_of_c_type t) n
 
@@ -633,6 +722,8 @@ let rec string_of_expr = function
   | Call (n, args) -> Printf.sprintf "%s(%s)" n (String.concat ", " (List.map string_of_expr args))
   | AddrOf e -> "&(" ^ (string_of_expr e) ^ ")"
   | Deref e -> "*(" ^ (string_of_expr e) ^ ")"
+  | MemberAccess (b, f) -> Printf.sprintf "%s.%s" (string_of_expr b) f
+  | PtrMemberAccess (b, f) -> Printf.sprintf "%s->%s" (string_of_expr b) f
   | ArrayAccess (b, i) -> Printf.sprintf "%s[%s]" (string_of_expr b) (string_of_expr i)
 
 let rec string_of_stmt indent = function
@@ -656,6 +747,15 @@ let string_of_global_def = function
   | GVar (t, n, e_opt) ->
       let init_str = match e_opt with Some e -> " = " ^ (string_of_expr e) | None -> "" in
       Printf.sprintf "Global Var: %s %s%s;" (string_of_c_type t) n init_str
+  | GStructDef s ->
+      let members_str = String.concat "; " (List.map (fun (t, n) -> (string_of_c_type t) ^ " " ^ n) s.s_members) in
+      Printf.sprintf "struct %s { %s; };" s.s_name members_str
+  | GUnionDef u ->
+      let members_str = String.concat "; " (List.map (fun (t, n) -> (string_of_c_type t) ^ " " ^ n) u.u_members) in
+      Printf.sprintf "union %s { %s; };" u.u_name members_str
+  | GEnumDef e ->
+      let members_str = String.concat ", " (List.map (fun (n, e_opt) -> n ^ (match e_opt with Some e -> " = " ^ string_of_expr e | None -> "")) e.e_members) in
+      Printf.sprintf "enum %s { %s };" (match e.e_name with Some n -> n | None -> "") members_str
   | GArray (t, n, s) ->
       Printf.sprintf "Global Array: %s %s[%s];" (string_of_c_type t) n (string_of_expr s)
 

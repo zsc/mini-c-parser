@@ -8,6 +8,9 @@ type c_type =
   | TInt
   | TFloat
   | TDouble
+  | TStruct of string
+  | TUnion of string
+  | TEnum of string
   | TPtr of c_type
   | TArray of c_type * int
 
@@ -32,6 +35,8 @@ type expr =
   | AddrOf of expr                  (* 取址操作: &v *)
   | Deref of expr                   (* 解引用操作: *p *)
   | ArrayAccess of expr * expr      (* 数组元素访问: e.g., arr[index] *)
+  | MemberAccess of expr * string   (* 结构体成员访问: s.field *)
+  | PtrMemberAccess of expr * string(* 结构体指针成员访问: p->field *)
 
 (* 语句类型 *)
 type stmt =
@@ -53,11 +58,28 @@ type func_def = {
   body     : stmt;                      (* 函数体, 是一个 Block *)
 }
 
+(* 结构体定义 *)
+type struct_def = {
+  s_name: string;
+  s_members: (c_type * string) list;
+}
+
+(* 联合体定义 *)
+type union_def = {
+  u_name: string;
+  u_members: (c_type * string) list;
+}
+
+(* 枚举定义 *)
+type enum_def = {
+  e_name: string option;
+  e_members: (string * expr option) list;
+}
+
 (* 顶层定义 *)
 type global_def =
-  | GFunc of func_def
-  | GVar of c_type * string * expr option
-  | GArray of c_type * string * expr
+  | GFunc of func_def | GVar of c_type * string * expr option | GArray of c_type * string * expr
+  | GStructDef of struct_def | GUnionDef of union_def | GEnumDef of enum_def
 
 (* 一个程序是顶层定义的列表 *)
 type program = global_def list

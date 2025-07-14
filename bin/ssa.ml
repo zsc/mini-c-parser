@@ -51,10 +51,12 @@ module Ssa = struct
     (* Phi node to merge values from different predecessor blocks.
        e.g., phi [op1, from_block1], [op2, from_block2] *)
     | D_Phi of (operand * bbid) list
-    (* Memory allocation on the stack, produces a pointer. *)
+    (* Memory allocation on the stack, produces a pointer. Type is LLVM type string. *)
     | D_Alloca of string (* The type being allocated, e.g., "int", "int*" *)
     | D_ArrayAlloca of string * operand
-    | D_GetElementPtr of operand * operand
+    (* GEP: base pointer, list of indices *)
+    | D_GetElementPtr of operand * operand list
+    | D_Bitcast of operand (* Bitcast an operand to the type of the destination register *)
     | D_SIToFP of operand (* Signed Integer to Floating Point conversion *)
     | D_FPToSI of operand (* Floating Point to Signed Integer conversion *)
     (* Load a value from a memory address (which is an operand). *)
@@ -141,7 +143,8 @@ module Dce = struct
         let ops = List.map (fun (op, _) -> op) phis in
         used_regs_from_operands ops
     | D_ArrayAlloca (_, size_op) -> used_regs_from_operand size_op
-    | D_GetElementPtr (base, index) -> used_regs_from_operands [base; index]
+    | D_GetElementPtr (base, indices) -> used_regs_from_operand base @ used_regs_from_operands indices
+    | D_Bitcast op -> used_regs_from_operand op
     | D_SIToFP op -> used_regs_from_operand op
     | D_FPToSI op -> used_regs_from_operand op
     | D_Alloca _ -> []
@@ -308,16 +311,47 @@ module Ast_to_ssa = struct
   let get_pointee_type (ptr_type: Ast.c_type) : Ast.c_type =
     match ptr_type with
     | TPtr t -> t
+    | TArray (t, _) -> t
     | _ -> failwith ("Ast_to_ssa: Cannot get pointee type of non-pointer type")
+
+  (* Forward declaration needed for mutual recursion with size_of_type *)
+  let union_env : (string, 'info) Hashtbl.t = Hashtbl.create 8
 
   let rec c_type_to_ll_string (t: c_type) : string =
     match t with
     | TVoid -> "void" | TChar -> "i8" | TInt -> "i32"
     | TFloat -> "float" | TDouble -> "double"
+    | TStruct s -> "%struct." ^ s
+    | TUnion u -> (Hashtbl.find union_env u).u_ll_type
     | TPtr p -> (c_type_to_ll_string p) ^ "*"
-    | TArray (_, _) -> failwith "c_type_to_ll_string should not be called on an array type"
+    | TEnum _ -> "i32" (* Enums are represented as integers *)
+    | TArray (t, _) -> (c_type_to_ll_string t) ^ "*"
 
   let func_return_types : (string, Ast.func_def) Hashtbl.t = Hashtbl.create 8
+
+  (* Type environments *)
+  type field_info = { f_type: Ast.c_type; f_index: int }
+  type struct_info = { s_members: (string, field_info) Hashtbl.t }
+  let struct_env : (string, struct_info) Hashtbl.t = Hashtbl.create 8
+
+  type union_info = {
+    u_members: (string, Ast.c_type) Hashtbl.t;
+    u_size: int;
+    u_align: int;
+    u_ll_type: string;
+  }
+  let () = Hashtbl.clear union_env (* Clear the forward-declared table to change its type *)
+  let union_env : (string, union_info) Hashtbl.t = Hashtbl.create 8
+
+  let enum_val_env : (string, int) Hashtbl.t = Hashtbl.create 16
+
+  let rec size_of_type t = match t with
+    | TVoid -> 0 | TChar -> 1 | TInt | TFloat | TEnum _ -> 4 | TDouble -> 8
+    | TPtr _ -> 4 (* Assuming 32-bit pointers *)
+    | TStruct s -> Hashtbl.find struct_env s |> (fun si -> si.s_members) |> Hashtbl.to_seq_values |> Seq.fold_left (fun acc f -> acc + size_of_type f.f_type) 0 (* Simplified; no padding *)
+    | TUnion u -> (Hashtbl.find union_env u).u_size
+    | TArray (et, n) -> n * size_of_type et
+
   type global_symbol_type =
     | GSymVar of Ast.c_type
     | GSymArray of Ast.c_type (* Element type *)
@@ -380,6 +414,8 @@ module Ast_to_ssa = struct
     Hashtbl.add ctx.reg_types reg typ;
     reg
 
+  let add_bitcast ctx op target_type = add_instr ctx (D_Bitcast op) target_type
+
   let get_string_label s =
     try Hashtbl.find global_strings s
     with Not_found ->
@@ -391,6 +427,62 @@ module Ast_to_ssa = struct
   let add_side_effect ctx sei =
     ctx.current_block_ops <- I_Side_Effect sei :: ctx.current_block_ops
 
+  let rec convert_lval_to_ptr ctx (expr: Ast.expr) : operand * Ast.c_type =
+    match expr with
+    | Id s -> (* Local or global variable *)
+        if Hashtbl.mem ctx.var_map s then
+          let ptr_reg = Hashtbl.find ctx.var_map s in
+          let var_type = Hashtbl.find ctx.var_types s in
+          (O_Reg ptr_reg, TPtr var_type)
+        else if Hashtbl.mem global_symbols s then
+          match Hashtbl.find global_symbols s with
+          | GSymVar typ -> (O_Global s, TPtr typ)
+          | GSymArray elem_typ -> (O_Global s, TPtr (TArray (elem_typ, 0)))
+        else failwith ("convert_lval_to_ptr: Undeclared identifier " ^ s)
+    | Deref ptr_expr -> (* *p *)
+        convert_expr ctx ptr_expr
+    | ArrayAccess (base, index) -> (* arr[i] or p[i] *)
+        let (base_op, base_type) = convert_expr ctx base in
+        let (index_op, _) = convert_expr ctx index in
+        let elem_ptr_type = match base_type with
+          | TPtr t -> t
+          | TArray(t,_) -> t
+          | _ -> failwith "Array access on non-pointer/array type"
+        in
+        let elem_ptr_reg = add_instr ctx (D_GetElementPtr (base_op, [index_op])) (TPtr elem_ptr_type) in
+        (O_Reg elem_ptr_reg, TPtr elem_ptr_type)
+    | MemberAccess (base, field) -> (* s.f *)
+        let (base_ptr_op, base_ptr_type) = convert_lval_to_ptr ctx base in
+        let s_type = get_pointee_type base_ptr_type in
+        (match s_type with
+        | TStruct s_name ->
+            let info = Hashtbl.find struct_env s_name in
+            let finfo = Hashtbl.find info.s_members field in
+            let field_ptr_reg = add_instr ctx (D_GetElementPtr (base_ptr_op, [O_CstI 0; O_CstI finfo.f_index])) (TPtr finfo.f_type) in
+            (O_Reg field_ptr_reg, TPtr finfo.f_type)
+        | TUnion u_name ->
+            let info = Hashtbl.find union_env u_name in
+            let f_type = Hashtbl.find info.u_members field in
+            let field_ptr_reg = add_bitcast ctx base_ptr_op (TPtr f_type) in
+            (O_Reg field_ptr_reg, TPtr f_type)
+        | _ -> failwith "Member access on non-struct/union type")
+    | PtrMemberAccess (base, field) -> (* p->f *)
+        let (ptr_op, ptr_type) = convert_expr ctx base in
+        let s_type = get_pointee_type ptr_type in
+        (match s_type with
+        | TStruct s_name ->
+            let info = Hashtbl.find struct_env s_name in
+            let finfo = Hashtbl.find info.s_members field in
+            let field_ptr_reg = add_instr ctx (D_GetElementPtr (ptr_op, [O_CstI 0; O_CstI finfo.f_index])) (TPtr finfo.f_type) in
+            (O_Reg field_ptr_reg, TPtr finfo.f_type)
+        | TUnion u_name ->
+            let info = Hashtbl.find union_env u_name in
+            let f_type = Hashtbl.find info.u_members field in
+            let field_ptr_reg = add_bitcast ctx ptr_op (TPtr f_type) in
+            (O_Reg field_ptr_reg, TPtr f_type)
+        | _ -> failwith "Pointer member access on non-struct/union pointer type")
+    | _ -> failwith "Expression is not a valid l-value"
+
   let rec convert_expr ctx (expr: Ast.expr) : operand * Ast.c_type =
     match expr with
     | CstI i -> (O_CstI i, TInt)
@@ -398,29 +490,19 @@ module Ast_to_ssa = struct
     | CstS s ->
         let label = get_string_label s in
         let ptr_type = TPtr TChar in
-        (O_Global label, ptr_type)
-    | Id s -> (* Can be a local var, a global var, or a global array name *)
-        if Hashtbl.mem ctx.var_map s then (* Local variable or parameter *)
-          let var_type = Hashtbl.find ctx.var_types s in
-          let ptr_reg = Hashtbl.find ctx.var_map s in
-          (match var_type with
-           | TArray(elem_type, _) ->
-              (* Array identifier decays to a pointer to the first element.
-                 The register in var_map already holds this pointer. *)
-              (O_Reg ptr_reg, TPtr elem_type)
-           | _ ->
-              (* Standard variable, load its value from the allocated stack space. *)
-              let res_reg = add_instr ctx (D_Load (O_Reg ptr_reg)) var_type in
-              (O_Reg res_reg, var_type))
-        else if Hashtbl.mem global_symbols s then (* Global symbol *)
-          match Hashtbl.find global_symbols s with
-          | GSymVar typ ->
-              let res_reg = add_instr ctx (D_Load (O_Global s)) typ in
-              (O_Reg res_reg, typ)
-          | GSymArray elem_typ ->
-              (O_Global s, TPtr elem_typ) (* Array name decays to pointer *)
+        (* Get a i8* to the first char of the string literal *)
+        let ptr_reg = add_instr ctx (D_GetElementPtr(O_Global label, [O_CstI 0; O_CstI 0])) ptr_type in
+        (O_Reg ptr_reg, ptr_type)
+    | Id s -> (* Can be a var, global, array name, or enum constant *)
+        if Hashtbl.mem enum_val_env s then
+            (O_CstI (Hashtbl.find enum_val_env s), TEnum "") (* The name of the enum type isn't tracked here, just that it's an enum *)
         else
-          failwith ("Undeclared identifier: " ^ s)
+            let (ptr_op, ptr_type) = convert_lval_to_ptr ctx (Id s) in
+            let pointee_type = get_pointee_type ptr_type in
+            (match pointee_type with
+             | TArray(elem_type, _) -> (ptr_op, TPtr elem_type) (* Array name decays to pointer *)
+             | _ -> let res_reg = add_instr ctx (D_Load ptr_op) pointee_type in (O_Reg res_reg, pointee_type)
+            )
     | BinOp (op, e1, e2) ->
         let (op1, t1) = convert_expr ctx e1 in
         let (op2, t2) = convert_expr ctx e2 in
@@ -442,46 +524,21 @@ module Ast_to_ssa = struct
         let res_reg = add_instr ctx (D_BinOp (op, final_op1, final_op2)) final_type in
         (O_Reg res_reg, final_type)
     | AddrOf e ->
-        (match e with
-         | Id s -> (* &var (local or global) *)
-            if Hashtbl.mem ctx.var_map s then (* local *)
-             let ptr_reg = Hashtbl.find ctx.var_map s in
-             let var_type = Hashtbl.find ctx.var_types s in
-             (O_Reg ptr_reg, TPtr var_type)
-            else if Hashtbl.mem global_symbols s then (* global *)
-              match Hashtbl.find global_symbols s with
-              | GSymVar typ -> (O_Global s, TPtr typ)
-              | GSymArray elem_typ -> (O_Global s, TPtr elem_typ) (* &arr is same as arr *)
-            else failwith ("AST to SSA: Address of undeclared variable " ^ s)
-         | Deref ptr_expr -> (* &( *p ) simplifies to p *)
-             convert_expr ctx ptr_expr
-         | ArrayAccess (base, index) -> (* &arr[i] *)
-             let (base_op, base_type) = convert_expr ctx base in
-             let (index_op, _) = convert_expr ctx index in
-             let res_reg = add_instr ctx (D_GetElementPtr (base_op, index_op)) base_type in
-             (O_Reg res_reg, base_type)
-         | _ ->
-             failwith "AST to SSA: Cannot take address of a non-lvalue expression")
+        convert_lval_to_ptr ctx e
     | Deref e -> (* *ptr_expr *)
         let (ptr_op, ptr_type) = convert_expr ctx e in
+        let pointee_type = get_pointee_type ptr_type in
+        let res_reg = add_instr ctx (D_Load ptr_op) pointee_type in
+        (O_Reg res_reg, pointee_type)
+    | ArrayAccess _ | MemberAccess _ | PtrMemberAccess _ ->
+        (* These are l-values. Get a pointer to it, then load. *)
+        let (ptr_op, ptr_type) = convert_lval_to_ptr ctx expr in
         let pointee_type = get_pointee_type ptr_type in
         let res_reg = add_instr ctx (D_Load ptr_op) pointee_type in
         (O_Reg res_reg, pointee_type)
     | Call (name, args) ->
         let arg_ops = List.map (fun e -> fst (convert_expr ctx e)) args in
         let func_info = try Hashtbl.find func_return_types name with Not_found -> failwith ("Call to undeclared function: " ^ name) in
-        let res_reg = add_instr ctx (D_Call (name, arg_ops)) func_info.ret_type in
-        (O_Reg res_reg, func_info.ret_type)
-    | ArrayAccess (base, index) ->
-        let (base_op, ptr_type) = convert_expr ctx base in
-        let (index_op, _) = convert_expr ctx index in
-        let elem_ptr_type = match ptr_type with
-          | TPtr t -> TPtr t | _ -> failwith "Array access on non-pointer type"
-        in
-        let element_ptr_reg = add_instr ctx (D_GetElementPtr (base_op, index_op)) elem_ptr_type in
-        let pointee_type = get_pointee_type elem_ptr_type in
-        let res_reg = add_instr ctx (D_Load (O_Reg element_ptr_reg)) pointee_type in
-        (O_Reg res_reg, pointee_type)
 
   let rec convert_stmt ctx (stmt: Ast.stmt) : unit =
     if ctx.is_sealed then () (* Unreachable code, do nothing *)
@@ -575,27 +632,9 @@ module Ast_to_ssa = struct
          | None -> ())
     | Assign (lhs, rhs) ->
         let (rhs_op, rhs_type) = convert_expr ctx rhs in
-        let get_lval_ptr_and_type = function
-          | Id s ->
-              if Hashtbl.mem ctx.var_map s then (* local *)
-                (O_Reg (Hashtbl.find ctx.var_map s), Hashtbl.find ctx.var_types s)
-              else if Hashtbl.mem global_symbols s then (* global *)
-                match Hashtbl.find global_symbols s with
-                | GSymVar typ -> (O_Global s, typ)
-                | GSymArray _ -> failwith "AST to SSA: Cannot assign to an array name"
-              else
-                failwith ("Assignment to undeclared variable: " ^ s)
-          | Deref ptr_expr -> let (addr_op, ptr_type) = convert_expr ctx ptr_expr in (addr_op, get_pointee_type ptr_type)
-          | ArrayAccess (base, index) ->
-              let (base_op, ptr_type) = convert_expr ctx base in
-              let (index_op, _) = convert_expr ctx index in
-              let elem_ptr_type = match ptr_type with TPtr t -> TPtr t | _ -> failwith "Array assign to non-pointer" in
-              let elem_ptr_reg = add_instr ctx (D_GetElementPtr (base_op, index_op)) elem_ptr_type in
-              (O_Reg elem_ptr_reg, get_pointee_type elem_ptr_type)
-          | _ -> failwith "AST to SSA: Assignment to non-lvalue not implemented"
-        in
-        let (lval_ptr_op, lval_type) = get_lval_ptr_and_type lhs in
-        let final_rhs_op = if lval_type <> rhs_type then (* Basic type coercion *)
+        let (lval_ptr_op, lval_ptr_type) = convert_lval_to_ptr ctx lhs in
+        let lval_type = get_pointee_type lval_ptr_type in
+        let final_rhs_op = if lval_type <> rhs_type then
           match lval_type, rhs_type with
           | (TFloat|TDouble), TInt -> O_Reg (add_instr ctx (D_SIToFP rhs_op) lval_type)
           | TInt, (TFloat|TDouble) -> O_Reg (add_instr ctx (D_FPToSI rhs_op) lval_type)
@@ -657,10 +696,11 @@ module Ast_to_ssa = struct
     List.iter (fun (name, (typ, size_opt)) ->
       if not (Hashtbl.mem ctx.var_map name) then
         let ptr_reg = match size_opt with
-          | None -> add_instr ctx (D_Alloca (c_type_to_ll_string typ)) (TPtr typ)
+          | None -> let ll_type = c_type_to_ll_string typ in
+                    add_instr ctx (D_Alloca ll_type) (TPtr typ)
           | Some size_expr ->
               let (size_op, _) = convert_expr ctx size_expr in (* Array address has type TPtr(elem_type) *)
-              add_instr ctx (D_ArrayAlloca (c_type_to_ll_string typ, size_op)) (TPtr typ)
+              add_instr ctx (D_ArrayAlloca (c_type_to_ll_string typ, size_op)) (TPtr (TArray(typ, 0)))
         in
         Hashtbl.add ctx.var_map name ptr_reg) all_decls;
 
@@ -689,19 +729,63 @@ module Ast_to_ssa = struct
     Hashtbl.clear func_return_types;
     Hashtbl.clear global_symbols;
     Hashtbl.clear global_strings;
+    Hashtbl.clear struct_env;
+    Hashtbl.clear union_env;
+    Hashtbl.clear enum_val_env;
     string_counter := 0;
+
+    let rec eval_const_expr = function
+      | CstI i -> i
+      | Id s -> (try Hashtbl.find enum_val_env s with Not_found -> failwith ("Enum const not found: " ^ s))
+      | _ -> failwith "Enum initializer must be a constant integer expression"
+    in
+
     List.iter (function
       | GFunc fdef -> Hashtbl.add func_return_types fdef.name fdef
       | GVar (typ, name, _) -> Hashtbl.add global_symbols name (GSymVar typ)
       | GArray (typ, name, _) -> Hashtbl.add global_symbols name (GSymArray typ)
+      | GStructDef sdef ->
+          let members_map = Hashtbl.create (List.length sdef.s_members) in
+          List.iteri (fun i (m_type, m_name) ->
+              Hashtbl.add members_map m_name { f_type = m_type; f_index = i }
+          ) sdef.s_members;
+          Hashtbl.add struct_env sdef.s_name { s_members = members_map }
+      | GUnionDef udef ->
+          let members_map = Hashtbl.create (List.length udef.u_members) in
+          let max_size = ref 0 in
+          let max_align = ref 1 in
+          let largest_type = ref TChar in
+          List.iter (fun (m_type, m_name) ->
+            Hashtbl.add members_map m_name m_type;
+            let sz = size_of_type m_type in
+            if sz > !max_size then (
+              max_size := sz;
+              largest_type := m_type;
+            );
+            (* align calculation is simplified *)
+            max_align := max !max_align (min sz 4)
+          ) udef.u_members;
+          Hashtbl.add union_env udef.u_name { u_members = members_map; u_size = !max_size; u_align = !max_align; u_ll_type = c_type_to_ll_string !largest_type }
+      | GEnumDef edef ->
+          let last_val = ref (-1) in
+          List.iter (fun (name, val_opt) ->
+              let v = match val_opt with
+                | Some e -> eval_const_expr e
+                | None -> !last_val + 1
+              in
+              last_val := v;
+              Hashtbl.add enum_val_env name v
+          ) edef.e_members;
     ) prog;
 
     (* Second pass: convert all functions to SSA *)
     let ssa_functions = List.filter_map (function
       | GFunc fdef -> Some (convert_func fdef)
       | _ -> None
-    ) prog in
-    let global_defs = List.filter (function GFunc _ -> false | _ -> true) prog in
+    ) prog
+    in
+    (* Codegen will need all global defs to generate type info and globals. *)
+    let global_defs = prog in
     (global_defs, ssa_functions)
 end
 
@@ -712,6 +796,9 @@ module Ssa_printer = struct
   let rec string_of_c_type (t: Ast.c_type) : string =
     match t with
     | TVoid -> "void" | TChar -> "char" | TInt -> "int"
+    | TStruct s -> "struct " ^ s
+    | TUnion u -> "union " ^ u
+    | TEnum e -> "enum " ^ (match e with "" -> "?" | _ -> e)
     | TFloat -> "float" | TDouble -> "double"
     | TPtr p -> (string_of_c_type p) ^ "*"
     | TArray (elem_t, size) -> Printf.sprintf "%s[%d]" (string_of_c_type elem_t) size
@@ -736,9 +823,10 @@ module Ssa_printer = struct
     | D_Phi phis -> "phi " ^ (String.concat ", " (List.map (fun (op, bbid) -> Printf.sprintf "[ %s, %s ]" (string_of_operand op) (string_of_bbid bbid)) phis))
     | D_Alloca typ -> Printf.sprintf "alloca %s" typ
     | D_ArrayAlloca (typ, size) -> Printf.sprintf "alloca %s, %s" typ (string_of_operand size)
+    | D_GetElementPtr (base, indices) -> Printf.sprintf "getelementptr %s, %s" (string_of_operand base) (String.concat ", " (List.map string_of_operand indices))
+    | D_Bitcast op -> Printf.sprintf "bitcast %s" (string_of_operand op)
     | D_SIToFP op -> Printf.sprintf "sitofp %s" (string_of_operand op)
     | D_FPToSI op -> Printf.sprintf "fptosi %s" (string_of_operand op)
-    | D_GetElementPtr (base, index) -> Printf.sprintf "getelementptr %s, %s" (string_of_operand base) (string_of_operand index)
     | D_Load op -> Printf.sprintf "load %s" (string_of_operand op)
 
   let string_of_instruction instr =
