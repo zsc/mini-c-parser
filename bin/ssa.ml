@@ -438,7 +438,12 @@ module Ast_to_ssa = struct
             let (ptr_op, ptr_type) = convert_lval_to_ptr ctx (Id s) in
             let pointee_type = get_pointee_type ptr_type in
             (match pointee_type with
-             | TArray(elem_type, _) -> (ptr_op, TPtr elem_type) (* Array name decays to pointer *)
+             | TArray(elem_type, _) ->
+                 (* Array name decays to a pointer to its first element.
+                    'ptr_op' points to the whole array, so we need a GEP to get the pointer
+                    to the first element. In LLVM terms, this is `gep base, 0, 0`. *)
+                 let first_elem_ptr_reg = add_instr ctx (D_GetElementPtr(ptr_op, [O_CstI 0; O_CstI 0])) (TPtr elem_type) in
+                 (O_Reg first_elem_ptr_reg, TPtr elem_type)
              | _ -> let res_reg = add_instr ctx (D_Load ptr_op) pointee_type in (O_Reg res_reg, pointee_type)
             )
     | BinOp (op, e1, e2) ->
