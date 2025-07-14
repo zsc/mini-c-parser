@@ -8,8 +8,7 @@
   This IR is designed to be independent of LLVM.
 *)
 
-open Ast (* For c_type *)
-open Ast (* For reusing the binop type *)
+open Ast
 
 (*
   SSA IR Definition
@@ -629,7 +628,7 @@ module Ast_to_ssa = struct
   let convert_program (prog: Ast.program) : Ssa.program =
     (* First pass: collect all function signatures *)
     Hashtbl.clear func_return_types;
-    List.iter (fun fdef -> Hashtbl.add func_return_types fdef.name fdef) prog;
+    List.iter (fun (fdef : Ast.top_level_def) -> Hashtbl.add func_return_types fdef.name fdef) prog;
     List.map convert_func prog
 end
 

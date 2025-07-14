@@ -175,7 +175,7 @@ and parse_stmt tokens = match tokens with
         | _ -> parse_stmt rest1 (* Non-empty: parse_stmt consumes the required semicolon *)
       in
       (* Parse condition *)
-      let (cond_expr, rest4) = if List.hd rest3 = T_Semicolon then (Cst 1, rest3) (* Empty cond is true *)
+      let (cond_expr, rest4) = if List.hd rest3 = T_Semicolon then (CstI 1, rest3) (* Empty cond is true *)
                                else parse_expr rest3 in
       let rest5 = expect T_Semicolon rest4 in
       (* Parse post-loop expression *)
@@ -274,7 +274,7 @@ and parse_multiplicative_expr tokens =
     | _ -> (lhs, toks)
   in let (lhs, r) = parse_unary_expr tokens in loop lhs r
 and parse_unary_expr tokens = match tokens with
-  | T_Minus :: r -> let (e, r') = parse_unary_expr r in (BinOp (Sub, Cst 0, e), r')
+  | T_Minus :: r -> let (e, r') = parse_unary_expr r in (BinOp (Sub, CstI 0, e), r')
   | T_Plus :: r -> parse_unary_expr r
   | T_Ampersand :: r -> let (e, r') = parse_unary_expr r in (AddrOf e, r') (* Must be parse_unary to handle &*p *)
   | T_Star :: r -> let (e, r') = parse_unary_expr r in (Deref e, r')
