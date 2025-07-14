@@ -157,13 +157,27 @@ let rec parse_program tokens : program * token list =
       (def :: defs, final_tokens)
 
 and parse_top_level_def tokens =
-  let (ret_type, rest1) = parse_c_type tokens in
-  let name, rest2 = match rest1 with T_Id s :: rest -> s, rest | _ -> fail_parse "Expected function name" in
-  let rest3 = expect T_Lparen rest2 in
-  let params, rest4 = parse_params rest3 in
-  let rest5 = expect T_Rparen rest4 in
-  let body, rest6 = parse_stmt rest5 in
-  ({ ret_type; name; params; body }, rest6)
+  let (base_type, rest1) = parse_c_type tokens in
+  let name, rest2 = match rest1 with T_Id s :: rest -> s, rest | _ -> fail_parse "Expected identifier in top-level definition" in
+  match rest2 with
+  | T_Lparen :: _ -> (* Function definition *)
+      let rest3 = expect T_Lparen rest2 in
+      let params, rest4 = parse_params rest3 in
+      let rest5 = expect T_Rparen rest4 in
+      let body, rest6 = parse_stmt rest5 in
+      (GFunc { ret_type = base_type; name; params; body }, rest6)
+  | T_Lbracket :: r -> (* Global array declaration *)
+      let (size_expr, r') = parse_expr r in
+      let r'' = expect T_Rbracket r' in
+      let r_final = expect T_Semicolon r'' in
+      (GArray (base_type, name, size_expr), r_final)
+  | T_Assign :: r -> (* Global variable with initializer *)
+      let (init_expr, r') = parse_expr r in
+      let r_final = expect T_Semicolon r' in
+      (GVar (base_type, name, Some init_expr), r_final)
+  | T_Semicolon :: r_final -> (* Global variable without initializer *)
+      (GVar (base_type, name, None), r_final)
+  | _ -> fail_parse "Malformed top-level definition: expected '(', '[', '=', or ';'"
 
 and parse_c_type tokens =
   let base_type, rest = match tokens with
@@ -474,7 +488,7 @@ module Codegen = struct
     | D_Phi _ -> failwith "LLVM Codegen: Phi nodes not supported in this simplified compiler"
     | D_Alloca typ ->
         [Printf.sprintf "  %s = alloca %s, align 4" dest_reg typ] (* Type is already stringified to LLVM *)
-    | D_ArrayAlloca (typ, size_op) ->
+    | D_ArrayAlloca (typ, size_op) -> (* Note: this is for local arrays on the stack *)
         let s_size = string_of_ssa_operand size_op in
         [Printf.sprintf "  %s = alloca %s, i32 %s, align 4" dest_reg typ s_size]
     | D_SIToFP op ->
@@ -553,7 +567,7 @@ module Codegen = struct
     let body_lines = List.concat_map (codegen_bb f func_info.ret_type) f.blocks in
     String.concat "\n" ([signature] @ body_lines @ ["}"])
 
-  let codegen_program (prog: Ssa.program) : (string, string) result =
+  let codegen_program (globals: Ast.global_def list) (prog: Ssa.program) : (string, string) result =
     try
         let llvm_escape_string s =
           let buf = Buffer.create (String.length s * 2) in
@@ -566,7 +580,23 @@ module Codegen = struct
           ) s;
           Buffer.contents buf
         in
-        let global_defs =
+        let global_var_defs = List.map (function
+          | GVar (typ, name, init_opt) ->
+              let ll_type = ll_type_of_c_type typ in
+              let (linkage, init_str) = match init_opt with
+                | Some (CstI i) -> ("global", string_of_int i)
+                | Some (CstF f) -> ("global", string_of_float f) (* Simplified float for now *)
+                | _ -> ("common global", "0") (* Uninitialized or non-const init defaults to 0 *)
+              in
+              Printf.sprintf "@%s = %s %s %s, align 4" name linkage ll_type init_str
+          | GArray (typ, name, size_expr) ->
+              let ll_elem_type = ll_type_of_c_type typ in
+              let size = match size_expr with CstI n -> n | _ -> failwith "Codegen: Global array size must be a constant integer" in
+              Printf.sprintf "@%s = common global [%d x %s] zeroinitializer, align 16" name size ll_elem_type
+          | GFunc _ -> "" (* Handled separately *)
+          ) globals in
+
+        let string_lits =
           Hashtbl.fold (fun str_val label acc ->
             let escaped_str = llvm_escape_string (str_val ^ "\000") in
             let len = String.length str_val + 1 in
@@ -574,8 +604,9 @@ module Codegen = struct
             def :: acc
           ) Ast_to_ssa.global_strings []
         in
+        let global_defs = global_var_defs @ string_lits in
         let func_defs = List.map codegen_func prog in
-        let full_module = String.concat "\n" global_defs ^ "\n\n" ^ String.concat "\n\n" func_defs in
+        let full_module = String.concat "\n" (List.filter ((<>) "") global_defs) ^ "\n\n" ^ String.concat "\n\n" func_defs in
         Ok full_module
     with
     | Failure msg -> Error ("Codegen failed: " ^ msg)
@@ -616,11 +647,17 @@ let rec string_of_stmt indent = function
   | Assign (l, r) -> Printf.sprintf "%sAssign %s = %s;" indent (string_of_expr l) (string_of_expr r)
   | ExprStmt e -> Printf.sprintf "%sExprStmt %s;" indent (string_of_expr e)
 
-let string_of_def (d: top_level_def) =
-  let params_str = String.concat ", " (List.map (fun (t, n) -> (string_of_c_type t) ^ " " ^ n) d.params) in
-  Printf.sprintf "Function %s %s(%s)\n%s" (string_of_c_type d.ret_type) d.name params_str (string_of_stmt "" d.body)
+let string_of_global_def = function
+  | GFunc f ->
+      let params_str = String.concat ", " (List.map (fun (t, n) -> (string_of_c_type t) ^ " " ^ n) f.params) in
+      Printf.sprintf "Function %s %s(%s)\n%s" (string_of_c_type f.ret_type) f.name params_str (string_of_stmt "" f.body)
+  | GVar (t, n, e_opt) ->
+      let init_str = match e_opt with Some e -> " = " ^ (string_of_expr e) | None -> "" in
+      Printf.sprintf "Global Var: %s %s%s;" (string_of_c_type t) n init_str
+  | GArray (t, n, s) ->
+      Printf.sprintf "Global Array: %s %s[%s];" (string_of_c_type t) n (string_of_expr s)
 
-let string_of_program (p: program) = String.concat "\n\n" (List.map string_of_def p)
+let string_of_program (p: program) = String.concat "\n\n" (List.map string_of_global_def p)
 
 (* Helper to read all content from a channel *)
 let read_all_from_channel chan =
@@ -701,7 +738,7 @@ let process_input input_code verbose is_test =
 
       (* --- Phase 2: AST to SSA Conversion --- *)
       if verbose then print_endline "PHASE 2: Converting AST to SSA IR...";
-      let ssa_ir = Ast_to_ssa.convert_program ast in
+      let (global_info, ssa_ir) = Ast_to_ssa.convert_program ast in
       if verbose then (
         print_endline "Successfully generated SSA IR:";
         print_endline (Ssa_printer.string_of_program ssa_ir);
@@ -719,7 +756,7 @@ let process_input input_code verbose is_test =
 
       (* --- Phase 4: Code Generation from SSA --- *)
       if verbose then print_endline "PHASE 4: Generating LLVM IR from SSA...";
-      match Codegen.codegen_program optimized_ssa_ir with
+      match Codegen.codegen_program global_info optimized_ssa_ir with
       | Error msg ->
           prerr_endline ("Codegen failed: " ^ msg);
           exit 1
@@ -744,14 +781,20 @@ let () =
 
   (* Simple test case with a float *)
   let input_code =
-    if is_test then "
+    if is_test then
+"
+int g;
+double y;
+
 int
 main()
 {
     double x;
+    g = 5;
     x = 1.5;
-    if (x > 1.0) {
-      return 1;
+    y = x + 2.0;
+    if (y > 1.0) {
+      return g;
     }
     return 0;
 }

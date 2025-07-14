@@ -9,6 +9,7 @@ type c_type =
   | TFloat
   | TDouble
   | TPtr of c_type
+  | TArray of c_type * int
 
 type binop =
   | Add | Sub | Mul | Div | Mod
@@ -44,15 +45,21 @@ type stmt =
   | Assign of expr * expr           (* 赋值语句: e.g., x = 5; arr[0] = 10; *)
   | ExprStmt of expr                (* 表达式作为语句: e.g., func(); *)
 
-(* 顶层定义 (目前只有函数) *)
-type top_level_def = {
+(* 函数定义 *)
+type func_def = {
   ret_type : c_type;                    (* 返回类型 *)
   name     : string;                    (* 函数名, e.g., "fac" *)
   params   : (c_type * string) list;    (* 参数列表 (类型, 名称) *)
   body     : stmt;                      (* 函数体, 是一个 Block *)
 }
 
+(* 顶层定义 *)
+type global_def =
+  | GFunc of func_def
+  | GVar of c_type * string * expr option
+  | GArray of c_type * string * expr
+
 (* 一个程序是顶层定义的列表 *)
-type program = top_level_def list
+type program = global_def list
 
 

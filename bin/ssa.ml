@@ -315,12 +315,19 @@ module Ast_to_ssa = struct
     | TVoid -> "void" | TChar -> "i8" | TInt -> "i32"
     | TFloat -> "float" | TDouble -> "double"
     | TPtr p -> (c_type_to_ll_string p) ^ "*"
+    | TArray (_, _) -> failwith "c_type_to_ll_string should not be called on an array type"
 
-  let func_return_types : (string, Ast.top_level_def) Hashtbl.t = Hashtbl.create 8
+  let func_return_types : (string, Ast.func_def) Hashtbl.t = Hashtbl.create 8
+  type global_symbol_type =
+    | GSymVar of Ast.c_type
+    | GSymArray of Ast.c_type (* Element type *)
+
+  let global_symbols : (string, global_symbol_type) Hashtbl.t = Hashtbl.create 8
   let global_strings : (string, string) Hashtbl.t = Hashtbl.create 8
   let string_counter = ref 0
 
   type ssa_builder_context = {
+    (* Counters and context for the current function being built *)
     mutable reg_counter: int;
     mutable bbid_counter: int;
     var_map: (string, reg) Hashtbl.t; (* var name -> reg holding pointer *)
@@ -392,11 +399,21 @@ module Ast_to_ssa = struct
         let label = get_string_label s in
         let ptr_type = TPtr TChar in
         (O_Global label, ptr_type)
-    | Id s -> (* Can be a variable or an array name *)
+    | Id s -> (* Can be a local var, a global var, or a global array name *)
+      if Hashtbl.mem ctx.var_map s then (* Local variable or parameter *)
         let var_type = Hashtbl.find ctx.var_types s in
         let ptr_reg = Hashtbl.find ctx.var_map s in
         let res_reg = add_instr ctx (D_Load (O_Reg ptr_reg)) var_type in
         (O_Reg res_reg, var_type)
+      else if Hashtbl.mem global_symbols s then (* Global symbol *)
+        match Hashtbl.find global_symbols s with
+        | GSymVar typ ->
+            let res_reg = add_instr ctx (D_Load (O_Global s)) typ in
+            (O_Reg res_reg, typ)
+        | GSymArray elem_typ ->
+            (O_Global s, TPtr elem_typ) (* Array name decays to pointer *)
+      else
+        failwith ("Undeclared identifier: " ^ s)
     | BinOp (op, e1, e2) ->
         let (op1, t1) = convert_expr ctx e1 in
         let (op2, t2) = convert_expr ctx e2 in
@@ -419,10 +436,16 @@ module Ast_to_ssa = struct
         (O_Reg res_reg, final_type)
     | AddrOf e ->
         (match e with
-         | Id s -> (* &var *)
+         | Id s -> (* &var (local or global) *)
+            if Hashtbl.mem ctx.var_map s then (* local *)
              let ptr_reg = Hashtbl.find ctx.var_map s in
              let var_type = Hashtbl.find ctx.var_types s in
              (O_Reg ptr_reg, TPtr var_type)
+            else if Hashtbl.mem global_symbols s then (* global *)
+              match Hashtbl.find global_symbols s with
+              | GSymVar typ -> (O_Global s, TPtr typ)
+              | GSymArray elem_typ -> (O_Global s, TPtr elem_typ) (* &arr is same as arr *)
+            else failwith ("AST to SSA: Address of undeclared variable " ^ s)
          | Deref ptr_expr -> (* &( *p ) simplifies to p *)
              convert_expr ctx ptr_expr
          | ArrayAccess (base, index) -> (* &arr[i] *)
@@ -546,7 +569,15 @@ module Ast_to_ssa = struct
     | Assign (lhs, rhs) ->
         let (rhs_op, rhs_type) = convert_expr ctx rhs in
         let get_lval_ptr_and_type = function
-          | Id s -> (O_Reg (Hashtbl.find ctx.var_map s), Hashtbl.find ctx.var_types s)
+          | Id s ->
+              if Hashtbl.mem ctx.var_map s then (* local *)
+                (O_Reg (Hashtbl.find ctx.var_map s), Hashtbl.find ctx.var_types s)
+              else if Hashtbl.mem global_symbols s then (* global *)
+                match Hashtbl.find global_symbols s with
+                | GSymVar typ -> (O_Global s, typ)
+                | GSymArray _ -> failwith "AST to SSA: Cannot assign to an array name"
+              else
+                failwith ("Assignment to undeclared variable: " ^ s)
           | Deref ptr_expr -> let (addr_op, ptr_type) = convert_expr ctx ptr_expr in (addr_op, get_pointee_type ptr_type)
           | ArrayAccess (base, index) ->
               let (base_op, ptr_type) = convert_expr ctx base in
@@ -586,7 +617,7 @@ module Ast_to_ssa = struct
     | Block stmts -> List.concat_map find_all_decls_in_stmt stmts
     | _ -> []
 
-  let convert_func (fdef: Ast.top_level_def) : Ssa.func_def =
+  let convert_func (fdef: Ast.func_def) : Ssa.func_def =
     let ctx = create_ctx () in
 
     (* Start the entry block *)
@@ -639,13 +670,25 @@ module Ast_to_ssa = struct
       reg_types = ctx.reg_types;
     }
 
-  let convert_program (prog: Ast.program) : Ssa.program =
-    (* First pass: collect all function signatures *)
+  let convert_program (prog: Ast.program) : (global_def list * Ssa.program) =
+    (* First pass: collect all function signatures and global symbols *)
     Hashtbl.clear func_return_types;
+    Hashtbl.clear global_symbols;
     Hashtbl.clear global_strings;
     string_counter := 0;
-    List.iter (fun (fdef : Ast.top_level_def) -> Hashtbl.add func_return_types fdef.name fdef) prog;
-    List.map convert_func prog
+    List.iter (function
+      | GFunc fdef -> Hashtbl.add func_return_types fdef.name fdef
+      | GVar (typ, name, _) -> Hashtbl.add global_symbols name (GSymVar typ)
+      | GArray (typ, name, _) -> Hashtbl.add global_symbols name (GSymArray typ)
+    ) prog;
+
+    (* Second pass: convert all functions to SSA *)
+    let ssa_functions = List.filter_map (function
+      | GFunc fdef -> Some (convert_func fdef)
+      | _ -> None
+    ) prog in
+    let global_defs = List.filter (function GFunc _ -> false | _ -> true) prog in
+    (global_defs, ssa_functions)
 end
 
 (* SSA IR Pretty Printer (for debugging) *)
