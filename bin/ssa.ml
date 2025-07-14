@@ -400,20 +400,27 @@ module Ast_to_ssa = struct
         let ptr_type = TPtr TChar in
         (O_Global label, ptr_type)
     | Id s -> (* Can be a local var, a global var, or a global array name *)
-      if Hashtbl.mem ctx.var_map s then (* Local variable or parameter *)
-        let var_type = Hashtbl.find ctx.var_types s in
-        let ptr_reg = Hashtbl.find ctx.var_map s in
-        let res_reg = add_instr ctx (D_Load (O_Reg ptr_reg)) var_type in
-        (O_Reg res_reg, var_type)
-      else if Hashtbl.mem global_symbols s then (* Global symbol *)
-        match Hashtbl.find global_symbols s with
-        | GSymVar typ ->
-            let res_reg = add_instr ctx (D_Load (O_Global s)) typ in
-            (O_Reg res_reg, typ)
-        | GSymArray elem_typ ->
-            (O_Global s, TPtr elem_typ) (* Array name decays to pointer *)
-      else
-        failwith ("Undeclared identifier: " ^ s)
+        if Hashtbl.mem ctx.var_map s then (* Local variable or parameter *)
+          let var_type = Hashtbl.find ctx.var_types s in
+          let ptr_reg = Hashtbl.find ctx.var_map s in
+          (match var_type with
+           | TArray(elem_type, _) ->
+              (* Array identifier decays to a pointer to the first element.
+                 The register in var_map already holds this pointer. *)
+              (O_Reg ptr_reg, TPtr elem_type)
+           | _ ->
+              (* Standard variable, load its value from the allocated stack space. *)
+              let res_reg = add_instr ctx (D_Load (O_Reg ptr_reg)) var_type in
+              (O_Reg res_reg, var_type))
+        else if Hashtbl.mem global_symbols s then (* Global symbol *)
+          match Hashtbl.find global_symbols s with
+          | GSymVar typ ->
+              let res_reg = add_instr ctx (D_Load (O_Global s)) typ in
+              (O_Reg res_reg, typ)
+          | GSymArray elem_typ ->
+              (O_Global s, TPtr elem_typ) (* Array name decays to pointer *)
+        else
+          failwith ("Undeclared identifier: " ^ s)
     | BinOp (op, e1, e2) ->
         let (op1, t1) = convert_expr ctx e1 in
         let (op2, t2) = convert_expr ctx e2 in
@@ -626,8 +633,15 @@ module Ast_to_ssa = struct
     (* Gather all types of parameters and local variables *)
     let all_decls = find_all_decls_in_stmt fdef.body in
     List.iter (fun (typ, name) -> Hashtbl.add ctx.var_types name typ) fdef.params;
-    List.iter (fun (name, (typ, _)) -> Hashtbl.add ctx.var_types name typ) all_decls;
-
+    List.iter (fun (name, (typ, size_opt)) ->
+      let var_type =
+        match size_opt with
+        | None -> typ
+        | Some (Ast.CstI n) -> TArray(typ, n)
+        | Some _ -> TArray(typ, -1) (* VLA, size not known at compile time *)
+      in
+      Hashtbl.add ctx.var_types name var_type
+    ) all_decls;
     (* Process parameters *)
     let param_regs = List.map (fun (param_type, name) ->
         let param_val_reg = new_reg ctx in (* This will hold the incoming value *)
