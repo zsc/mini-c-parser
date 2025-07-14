@@ -539,6 +539,7 @@ module Ast_to_ssa = struct
     | Call (name, args) ->
         let arg_ops = List.map (fun e -> fst (convert_expr ctx e)) args in
         let func_info = try Hashtbl.find func_return_types name with Not_found -> failwith ("Call to undeclared function: " ^ name) in
+        () (* TODO *)
 
   let rec convert_stmt ctx (stmt: Ast.stmt) : unit =
     if ctx.is_sealed then () (* Unreachable code, do nothing *)
@@ -622,29 +623,29 @@ module Ast_to_ssa = struct
             ctx.is_sealed <- false
           ) (* Otherwise, both paths terminated, so subsequent code is unreachable and is_sealed is left as true. *)
 
-    | Block stmts -> List.iter (convert_stmt ctx) stmts
-    | Decl (_, name, init_opt) ->
-        let ptr_reg = Hashtbl.find ctx.var_map name in (* Must have been pre-allocated *)
-        (match init_opt with
-         | Some e ->
-             let (val_op, _) = convert_expr ctx e in
-             add_side_effect ctx (S_Store (O_Reg ptr_reg, val_op))
-         | None -> ())
-    | Assign (lhs, rhs) ->
-        let (rhs_op, rhs_type) = convert_expr ctx rhs in
-        let (lval_ptr_op, lval_ptr_type) = convert_lval_to_ptr ctx lhs in
-        let lval_type = get_pointee_type lval_ptr_type in
-        let final_rhs_op = if lval_type <> rhs_type then
-          match lval_type, rhs_type with
-          | (TFloat|TDouble), TInt -> O_Reg (add_instr ctx (D_SIToFP rhs_op) lval_type)
-          | TInt, (TFloat|TDouble) -> O_Reg (add_instr ctx (D_FPToSI rhs_op) lval_type)
-          | _, _ -> rhs_op
-        else rhs_op
-        in
-        add_side_effect ctx (S_Store (lval_ptr_op, final_rhs_op))
-    | ExprStmt e ->
-        let _ = convert_expr ctx e in ()
-    | ArrayDecl (_, _, _) -> () (* Handled in pre-allocation phase *)
+        | Block stmts -> List.iter (convert_stmt ctx) stmts
+        | Decl (_, name, init_opt) ->
+            let ptr_reg = Hashtbl.find ctx.var_map name in (* Must have been pre-allocated *)
+            (match init_opt with
+            | Some e ->
+                let (val_op, _) = convert_expr ctx e in
+                add_side_effect ctx (S_Store (O_Reg ptr_reg, val_op))
+            | None -> ())
+        | Assign (lhs, rhs) ->
+            let (rhs_op, rhs_type) = convert_expr ctx rhs in
+            let (lval_ptr_op, lval_ptr_type) = convert_lval_to_ptr ctx lhs in
+            let lval_type = get_pointee_type lval_ptr_type in
+            let final_rhs_op = if lval_type <> rhs_type then
+            match lval_type, rhs_type with
+            | (TFloat|TDouble), TInt -> O_Reg (add_instr ctx (D_SIToFP rhs_op) lval_type)
+            | TInt, (TFloat|TDouble) -> O_Reg (add_instr ctx (D_FPToSI rhs_op) lval_type)
+            | _, _ -> rhs_op
+            else rhs_op
+            in
+            add_side_effect ctx (S_Store (lval_ptr_op, final_rhs_op))
+        | ExprStmt e ->
+            let _ = convert_expr ctx e in ()
+        | ArrayDecl (_, _, _) -> () (* Handled in pre-allocation phase *)
 
   (* Finds all local variable and array declarations within a statement.
      Returns a list of (name, type, size_expr option).
