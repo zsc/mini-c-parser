@@ -91,6 +91,7 @@ def main():
         compile_stdout, compile_stderr, compile_exit_code = run_command(compile_cmd, stdin_content=c_code)
         
         file_result['compilation'] = {
+            'input': c_code,
             'command': f"{' '.join(compile_cmd)} < {c_file_path}",
             'verbose_output': compile_stdout.strip(),
             'stderr': compile_stderr.strip(),
