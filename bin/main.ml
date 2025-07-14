@@ -19,8 +19,7 @@ open Ast
 open Ssa
 
 
-(* II. Tokenizer (Lexer) *)
-(* (Unaltered) *)
+(* Tokenizer (Lexer) *)
 
 type token =
   | T_Int | T_Return | T_If | T_Else | T_While | T_For | T_Do
@@ -64,8 +63,7 @@ let tokenize str =
       in find_match token_specs
   in next_token 0
 
-(* III. Parser *)
-(* (Unaltered) *)
+(* Parser *)
 
 exception Parser_error of string
 
@@ -296,7 +294,7 @@ let parse_from_string str =
   | Failure msg -> Error ("Lexer/Parser failure: " ^ msg)
 
 
-(* VI. Code Generation (from SSA to LLVM IR) *)
+(* Code Generation (from SSA to LLVM IR) *)
 module Codegen = struct
   open Ssa
   open Ast_to_ssa
@@ -418,7 +416,7 @@ module Codegen = struct
     | Failure msg -> Error ("Codegen failed: " ^ msg)
 end
 
-(* VII. AST Pretty Printer (for debugging) *)
+(* AST Pretty Printer (for debugging) *)
 let rec string_of_expr = function
   | Cst n -> string_of_int n | Id s -> s
   | BinOp (op, e1, e2) ->
@@ -451,7 +449,7 @@ let string_of_def (d: top_level_def) =
 let string_of_program (p: program) = String.concat "\n\n" (List.map string_of_def p)
 
 
-(* VIII. Main Driver *)
+(* Main Driver *)
 
 (* Helper to read all content from a channel *)
 let read_all_from_channel chan =

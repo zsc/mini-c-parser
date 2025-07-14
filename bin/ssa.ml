@@ -11,7 +11,7 @@
 open Ast (* For reusing the binop type *)
 
 (*
-  I. SSA IR Definition
+  SSA IR Definition
   --------------------
   This IR is structured around functions, basic blocks, and instructions.
   Every instruction that produces a value assigns it to a unique virtual
@@ -110,7 +110,7 @@ end
 
 
 (*
-  II. Dead Code Elimination (DCE) Pass
+  Dead Code Elimination (DCE) Pass
   ------------------------------------
   This pass removes instructions whose results are never used.
 *)
@@ -290,7 +290,7 @@ module Dce = struct
 
 end
 
-(* IV. AST to SSA Conversion *)
+(* AST to SSA Conversion *)
 module Ast_to_ssa = struct
   open Ssa
 
@@ -563,7 +563,7 @@ module Ast_to_ssa = struct
     List.map convert_func prog
 end
 
-(* V. SSA IR Pretty Printer (for debugging) *)
+(* SSA IR Pretty Printer (for debugging) *)
 module Ssa_printer = struct
   open Ssa
 
